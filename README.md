@@ -56,12 +56,14 @@ OneTimePE/
 
 ## 직접 다시 빌드하기 (`clang++` / `g++` / Visual Studio `cl.exe` 모두 지원)
 
-LLVM-MinGW(`clang++`), 일반 MinGW-w64(`g++`), 또는 Visual Studio(`cl.exe`)가 설치된 환경에서 아래 명령을 실행하면 `PEBoot\OneTimePE.exe`가 생성됩니다.
+LLVM-MinGW(`clang++`), 일반 MinGW-w64(`g++`), 또는 Visual Studio(`cl.exe`)가 설치된 환경에서 실행하면 `PEBoot\OneTimePE.exe`가 생성됩니다.
 
-```powershell
-# 로컬 소스 빌드
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-
-# 다른 PC(Git 복제 환경)에서 최신 원격 커밋 강제 동기화 후 빌드
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Sync
-```
+- **방법 1 (가장 간편)**: 탐색기에서 **`build.bat` 더블 클릭** (최신 소스 자동 감지/동기화 후 즉시 빌드)
+- **방법 2**: PowerShell에서 실행:
+  ```powershell
+  # 기본 실행 시 이전 빌드로 인한 바이너리 충돌을 자동 해결하고 GitHub 최신 소스로 자동 동기화 후 빌드됩니다.
+  powershell -ExecutionPolicy Bypass -File .\build.ps1
+  
+  # 로컬에서 소스를 직접 수정 중이어서 Git 자동 동기화를 건너뛰고 싶을 때만 -NoSync 사용:
+  powershell -ExecutionPolicy Bypass -File .\build.ps1 -NoSync
+  ```

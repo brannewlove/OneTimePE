@@ -26,22 +26,17 @@ git clone https://github.com/brannewlove/OneTimePE.git
 cd OneTimePE
 ```
 
-#### 이미 복제한(Clone) 다른 환경에서 최신 수정본 받아 다시 빌드하기 (중요!)
+#### 이미 복제한(Clone) 다른 환경에서 최신 수정본 받아 다시 빌드하기
 
-저장소에 포함된 `PEBoot\OneTimePE.exe`나 이전 빌드 산출물이 타겟 PC에서 수정된 상태이면 일반 `git pull` 실행 시 충돌로 인해 소스 코드(`src\*`)가 갱신되지 않고 **예전 소스가 그대로 다시 빌드**될 수 있습니다.
+이제 빌드 스크립트([build.ps1](file:///d:/Code/OneTimePE/build.ps1))에 **지능형 Git 자동 동기화 기능**이 기본 내장되었습니다.
 
-다른 환경에서 최신 수정을 받아 빌드할 때는 반드시 아래 원클릭 동기화 빌드 명령을 사용하세요:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Sync
-```
-
-(또는 수동으로 `git fetch origin; git reset --hard origin/main` 실행 후 `.\build.ps1` 실행)
-
-> **참고**: 저장소에 이전 테스트 환경의 산출물(`build/`, `PEBoot/NetConfig/`)이 포함되어 있을 경우, 새 환경에서 빌드하기 전 아래 명령으로 정리하는 것을 권장합니다.
-> ```powershell
-> Remove-Item -Recurse -Force .\build, .\PEBoot\NetConfig, .\PEBoot\OneTimePE.ini -ErrorAction SilentlyContinue
-> ```
+- **방법 1 (가장 간편)**: 탐색기에서 **`build.bat`을 더블 클릭**하기만 하면 자동으로 Git 최신 소스를 땡겨와 빌드합니다.
+- **방법 2**: PowerShell에서 실행:
+  ```powershell
+  # 별도 옵션 없이 실행해도 이전 빌드 파일 충돌을 자동 정리하고 최신 소스를 동기화하여 빌드합니다.
+  powershell -ExecutionPolicy Bypass -File .\build.ps1
+  ```
+  *(참고: 타 환경에서 소스 코드를 직접 수정 중일 때만 `-NoSync` 옵션을 붙여 원격 동기화를 건너뛸 수 있습니다.)*
 
 ---
 

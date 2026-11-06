@@ -1,35 +1,57 @@
 param(
-    [switch]$Sync
+    [switch]$NoSync,   # 로컬에서 소스를 직접 수정 중일 때 원격 동기화를 건너뛰는 옵션
+    [switch]$Sync      # 하위 호환성 유지 (기본값으로 자동 동기화됨)
 )
 
 $ErrorActionPreference = "Stop"
+try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildDir = Join-Path $root "build"
 $distDir = Join-Path $root "PEBoot"
 $outExe = Join-Path $distDir "OneTimePE.exe"
 
-# Optional Git sync (solves git pull conflicts caused by locally rebuilt PEBoot/OneTimePE.exe or NetConfig)
+# ==============================================================================
+# 지능형 Git 자동 동기화 (타 환경에서 pull 충돌로 옛날 코드가 빌드되는 문제 영구 해결)
+# ==============================================================================
 if ((Test-Path (Join-Path $root ".git")) -and (Get-Command git -ErrorAction SilentlyContinue)) {
-    if ($Sync) {
-        Write-Host "[Git] Fetching and resetting to latest origin/main..." -ForegroundColor Yellow
-        & git -C $root fetch origin
-        if ($LASTEXITCODE -ne 0) { throw "git fetch origin failed." }
-        & git -C $root reset --hard origin/main
-        if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/main failed." }
-    } else {
-        # Check if local repo is dirty due to locally rebuilt PEBoot/OneTimePE.exe
-        $dirtyFiles = (& git -C $root status --porcelain 2>$null)
-        if ($dirtyFiles) {
-            $hasDirtyExe = $dirtyFiles | Where-Object { $_ -match "PEBoot/OneTimePE\.exe" }
-            if ($hasDirtyExe) {
-                Write-Host "[Git 주의] 다른 환경에서 이전 빌드로 생성된 PEBoot/OneTimePE.exe 로 인해 일반 'git pull' 시 충돌(overwrite 거부)이 발생할 수 있습니다." -ForegroundColor Yellow
-                Write-Host "         최신 GitHub 코드를 강제 동기화하여 빌드하려면 '.\build.ps1 -Sync' 를 실행하세요." -ForegroundColor Yellow
+    $hasRemote = (& git -C $root remote 2>$null) -contains "origin"
+    
+    if ($hasRemote -and -not $NoSync) {
+        # 1. 로컬에 사용자 소스코드(src/ 폴더) 수정 작업이 있는지 검사
+        $srcDirty = (& git -C $root status --porcelain src/ 2>$null)
+        
+        if ($srcDirty) {
+            Write-Host "[Git] 로컬 소스 코드(src/) 수정 작업이 감지되어 원격 동기화를 건너뛰고 로컬 소스로 빌드합니다." -ForegroundColor Yellow
+        } else {
+            # 2. 소스 수정이 없다면, 이전 빌드로 생성된 바이너리/캐시(PEBoot/OneTimePE.exe, build/ 등)로 인한 pull 충돌 방지
+            & git -C $root checkout -- PEBoot/OneTimePE.exe 2>$null
+            
+            # 3. 원격 저장소 최신 커밋 확인 및 자동 갱신
+            Write-Host "[Git] GitHub 원격 저장소(origin/main) 최신 소스 확인 중..." -ForegroundColor DarkCyan
+            & git -C $root fetch origin 2>$null
+            
+            if ($LASTEXITCODE -eq 0) {
+                $localCommit  = (& git -C $root rev-parse HEAD 2>$null)
+                $remoteCommit = (& git -C $root rev-parse origin/main 2>$null)
+                
+                if ($localCommit -and $remoteCommit -and ($localCommit -ne $remoteCommit)) {
+                    Write-Host "[Git] 최신 업데이트 발견! 로컬 소스를 origin/main 으로 자동 갱신합니다..." -ForegroundColor Green
+                    & git -C $root reset --hard origin/main
+                } else {
+                    Write-Host "[Git] 로컬 소스가 이미 최신 상태(origin/main)입니다." -ForegroundColor DarkCyan
+                }
+            } else {
+                Write-Host "[Git] 원격 연결 실패(오프라인/인증) — 현재 로컬 소스로 계속 진행합니다." -ForegroundColor DarkGray
             }
         }
     }
+    
     $headInfo = (& git -C $root log -n 1 --format="%h (%ci) %s" 2>$null)
     if ($headInfo) {
-        Write-Host "[Git] Building local commit: $headInfo" -ForegroundColor DarkCyan
+        Write-Host "==================================================================" -ForegroundColor Cyan
+        Write-Host "[Git 빌드 대상] $headInfo" -ForegroundColor White
+        Write-Host "==================================================================" -ForegroundColor Cyan
     }
 }
 
