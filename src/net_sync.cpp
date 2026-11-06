@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <set>
 
@@ -313,11 +314,11 @@ std::map<std::wstring, std::wstring> QueryConnectedWifiProfilesByGuid() {
     using FnWlanFreeMemory     = VOID(WINAPI*)(PVOID);
     using FnWlanCloseHandle    = DWORD(WINAPI*)(HANDLE, PVOID);
 
-    auto pOpen  = reinterpret_cast<FnWlanOpenHandle>(GetProcAddress(hWlan, "WlanOpenHandle"));
-    auto pEnum  = reinterpret_cast<FnWlanEnumInterfaces>(GetProcAddress(hWlan, "WlanEnumInterfaces"));
-    auto pQuery = reinterpret_cast<FnWlanQueryInterface>(GetProcAddress(hWlan, "WlanQueryInterface"));
-    auto pFree  = reinterpret_cast<FnWlanFreeMemory>(GetProcAddress(hWlan, "WlanFreeMemory"));
-    auto pClose = reinterpret_cast<FnWlanCloseHandle>(GetProcAddress(hWlan, "WlanCloseHandle"));
+    auto pOpen  = reinterpret_cast<FnWlanOpenHandle>(reinterpret_cast<void*>(GetProcAddress(hWlan, "WlanOpenHandle")));
+    auto pEnum  = reinterpret_cast<FnWlanEnumInterfaces>(reinterpret_cast<void*>(GetProcAddress(hWlan, "WlanEnumInterfaces")));
+    auto pQuery = reinterpret_cast<FnWlanQueryInterface>(reinterpret_cast<void*>(GetProcAddress(hWlan, "WlanQueryInterface")));
+    auto pFree  = reinterpret_cast<FnWlanFreeMemory>(reinterpret_cast<void*>(GetProcAddress(hWlan, "WlanFreeMemory")));
+    auto pClose = reinterpret_cast<FnWlanCloseHandle>(reinterpret_cast<void*>(GetProcAddress(hWlan, "WlanCloseHandle")));
 
     if (pOpen && pEnum && pQuery && pFree && pClose) {
         DWORD negVer = 0;
@@ -720,6 +721,311 @@ std::wstring ComputeFileSignature(const std::wstring& fullPath) {
     return buf;
 }
 
+namespace {
+
+#pragma pack(push, 1)
+struct WimResHdrDiskShort {
+    uint64_t sizeAndFlags; // Low 56 bits = size on disk, High 8 bits = flags (0x04 = compressed)
+    uint64_t offset;       // File offset in bytes
+    uint64_t originalSize; // Uncompressed size in bytes
+};
+
+struct WimHeaderV1Packed {
+    char               imageTag[8];       // "MSWIM\0\0\0"
+    uint32_t           cbSize;            // 208 (0xD0)
+    uint32_t           dwVersion;
+    uint32_t           dwFlags;           // 0x00080000 = FLAG_HEADER_COMPRESS_LZMS (ESD)
+    uint32_t           dwCompressionSize;
+    BYTE               gWIMGuid[16];
+    uint16_t           usPartNumber;
+    uint16_t           usTotalParts;
+    uint32_t           dwImageCount;
+    WimResHdrDiskShort rhOffsetTable;
+    WimResHdrDiskShort rhXmlData;
+    WimResHdrDiskShort rhBootMetadata;
+    uint32_t           dwBootIndex;
+    WimResHdrDiskShort rhIntegrity;
+    BYTE               bUnused[60];
+};
+#pragma pack(pop)
+
+static_assert(sizeof(WimHeaderV1Packed) == 208, "WIMHEADER_V1_PACKED must be 208 bytes");
+
+std::wstring ExtractXmlTagValue(const std::wstring& xml, const std::wstring& tagUpper) {
+    std::wstring upXml = ToUpper(xml);
+    std::wstring openTag  = L"<" + tagUpper + L">";
+    std::wstring closeTag = L"</" + tagUpper + L">";
+    size_t st = upXml.find(openTag);
+    if (st == std::wstring::npos) return L"";
+    st += openTag.size();
+    size_t ed = upXml.find(closeTag, st);
+    if (ed == std::wstring::npos || ed < st) return L"";
+    return Trim(xml.substr(st, ed - st));
+}
+
+bool TrySetWimBootIndexViaWimgapi(const std::wstring& wimFullPath, uint32_t targetIndex) {
+    DWORD attr = GetFileAttributesW(wimFullPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (attr & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(wimFullPath.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    HMODULE hWimDll = LoadLibraryW(L"wimgapi.dll");
+    if (!hWimDll) return false;
+
+    using FnWIMCreateFile     = HANDLE(WINAPI*)(PCWSTR, DWORD, DWORD, DWORD, DWORD, PDWORD);
+    using FnWIMSetTempPath    = BOOL(WINAPI*)(HANDLE, PCWSTR);
+    using FnWIMSetBootImage   = BOOL(WINAPI*)(HANDLE, DWORD);
+    using FnWIMCloseHandle    = BOOL(WINAPI*)(HANDLE);
+
+    auto pCreate  = reinterpret_cast<FnWIMCreateFile>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCreateFile")));
+    auto pSetTemp = reinterpret_cast<FnWIMSetTempPath>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMSetTemporaryPath")));
+    auto pSetBoot = reinterpret_cast<FnWIMSetBootImage>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMSetBootImage")));
+    auto pClose   = reinterpret_cast<FnWIMCloseHandle>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCloseHandle")));
+
+    bool ok = false;
+    if (pCreate && pSetBoot && pClose) {
+        DWORD cr = 0;
+        HANDLE hWim = pCreate(wimFullPath.c_str(), GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING, 0, 0, &cr);
+        if (hWim && hWim != INVALID_HANDLE_VALUE) {
+            wchar_t tmpDir[MAX_PATH]{};
+            if (pSetTemp && GetTempPathW(MAX_PATH, tmpDir) > 0) {
+                pSetTemp(hWim, tmpDir);
+            }
+            ok = (pSetBoot(hWim, targetIndex) != FALSE);
+            pClose(hWim);
+        }
+    }
+    FreeLibrary(hWimDll);
+    return ok;
+}
+
+} // namespace
+
+WimInspectionInfo InspectWimFile(const std::wstring& wimFullPath) {
+    WimInspectionInfo info{};
+    HANDLE hFile = CreateFileW(wimFullPath.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return info;
+
+    info.fileOpened = true;
+    WimHeaderV1Packed hdr{};
+    DWORD bytesRead = 0;
+    if (!ReadFile(hFile, &hdr, sizeof(hdr), &bytesRead, nullptr) || bytesRead < sizeof(hdr)) {
+        CloseHandle(hFile);
+        return info;
+    }
+
+    const char kMagic[8] = { 'M', 'S', 'W', 'I', 'M', '\0', '\0', '\0' };
+    if (std::memcmp(hdr.imageTag, kMagic, 8) != 0) {
+        CloseHandle(hFile);
+        return info;
+    }
+
+    info.validWimMagic = true;
+    info.isLzmsEsd     = (hdr.dwFlags & 0x00080000u) != 0; // FLAG_HEADER_COMPRESS_LZMS
+    info.isSplitSwm    = (hdr.usTotalParts > 1);
+    info.imageCount    = hdr.dwImageCount;
+    info.bootIndex     = hdr.dwBootIndex;
+
+    // Parse uncompressed UTF-16LE XML manifest if present
+    uint64_t xmlSize  = hdr.rhXmlData.sizeAndFlags & 0x00FFFFFFFFFFFFFFULL;
+    uint8_t  xmlFlags = static_cast<uint8_t>(hdr.rhXmlData.sizeAndFlags >> 56);
+    if ((xmlFlags & 0x04) == 0 && xmlSize >= 4 && xmlSize <= (4u * 1024u * 1024u)) {
+        LARGE_INTEGER seekPos{};
+        seekPos.QuadPart = static_cast<LONGLONG>(hdr.rhXmlData.offset);
+        if (SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) {
+            std::vector<BYTE> xmlBytes(static_cast<size_t>(xmlSize));
+            DWORD xmlRead = 0;
+            if (ReadFile(hFile, xmlBytes.data(), static_cast<DWORD>(xmlSize), &xmlRead, nullptr) && xmlRead >= 4) {
+                size_t byteOffset = 0;
+                if (xmlBytes[0] == 0xFF && xmlBytes[1] == 0xFE) {
+                    byteOffset = 2;
+                }
+                std::wstring xmlStr(reinterpret_cast<const wchar_t*>(xmlBytes.data() + byteOffset),
+                                    (xmlRead - byteOffset) / sizeof(wchar_t));
+
+                uint32_t targetIdx = (info.bootIndex > 0) ? info.bootIndex
+                                                          : ((info.imageCount > 0) ? info.imageCount : 1u);
+                std::wstring upXml = ToUpper(xmlStr);
+                std::wstring idxMarker = L"<IMAGE INDEX=\"" + std::to_wstring(targetIdx) + L"\"";
+                size_t imgStart = upXml.find(idxMarker);
+                if (imgStart == std::wstring::npos) {
+                    imgStart = upXml.find(L"<IMAGE ");
+                }
+
+                std::wstring slice = xmlStr;
+                if (imgStart != std::wstring::npos) {
+                    size_t imgEnd = upXml.find(L"</IMAGE>", imgStart);
+                    slice = (imgEnd != std::wstring::npos)
+                            ? xmlStr.substr(imgStart, imgEnd - imgStart)
+                            : xmlStr.substr(imgStart);
+                }
+
+                info.imageName = ExtractXmlTagValue(slice, L"NAME");
+                std::wstring archStr = ExtractXmlTagValue(slice, L"ARCH");
+                if (!archStr.empty()) {
+                    info.arch = _wtoi(archStr.c_str());
+                }
+                std::wstring buildStr = ExtractXmlTagValue(slice, L"BUILD");
+                if (!buildStr.empty()) {
+                    info.osBuild = _wtoi(buildStr.c_str());
+                }
+                std::wstring sysRoot = ExtractXmlTagValue(slice, L"SYSTEMROOT");
+                if (!sysRoot.empty()) {
+                    if (sysRoot.front() != L'\\') sysRoot = L"\\" + sysRoot;
+                    info.systemRoot = sysRoot;
+                }
+            }
+        }
+    }
+
+    CloseHandle(hFile);
+    return info;
+}
+
+bool ConvertEsdWimToBootableWim(const std::wstring& wimFullPath,
+                                uint32_t sourceIndex,
+                                const LogCallback& logCb,
+                                std::wstring& outNewWimSig) {
+    outNewWimSig.clear();
+    DWORD attr = GetFileAttributesW(wimFullPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (attr & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(wimFullPath.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    if (sourceIndex == 0) sourceIndex = 1;
+    std::wstring tmpWim = wimFullPath + L".bootfix.tmp";
+    std::wstring bakWim = wimFullPath + L".esd.bak";
+    DeleteFileW(tmpWim.c_str());
+
+    if (logCb) {
+        logCb(L"--- WIM 이미지를 RAMDisk 부팅 표준 포맷(LZX + Bootable)으로 변환 시작 ---");
+    }
+
+    std::wstring exportArgs =
+        L"/English /Export-Image /SourceImageFile:\"" + wimFullPath +
+        L"\" /SourceIndex:" + std::to_wstring(sourceIndex) +
+        L" /DestinationImageFile:\"" + tmpWim +
+        L"\" /Compress:max /Bootable";
+
+    ExecOutput er = RunHiddenProcess(L"dism.exe", exportArgs, logCb, true);
+    if (er.exitCode != 0 || GetFileAttributesW(tmpWim.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        DeleteFileW(tmpWim.c_str());
+        if (logCb) logCb(L"오류: DISM 이미지 변환(/Export-Image)에 실패했습니다.");
+        return false;
+    }
+
+    DeleteFileW(bakWim.c_str());
+    if (!MoveFileExW(wimFullPath.c_str(), bakWim.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmpWim.c_str());
+        if (logCb) logCb(L"오류: 원본 WIM 파일을 교체할 수 없습니다 (다른 프로그램이 사용 중인지 확인하세요).");
+        return false;
+    }
+
+    if (!MoveFileExW(tmpWim.c_str(), wimFullPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        // Restore backup on failure
+        MoveFileExW(bakWim.c_str(), wimFullPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        if (logCb) logCb(L"오류: 변환된 WIM 파일 이름 변경에 실패하여 원본을 복원했습니다.");
+        return false;
+    }
+
+    DeleteFileW(bakWim.c_str());
+    outNewWimSig = ComputeFileSignature(wimFullPath);
+    if (logCb) logCb(L"★ RAMDisk 부팅 표준 WIM 변환 및 Bootable 플래그 설정 완료!");
+    return true;
+}
+
+bool EnsureWimBootableFlag(const std::wstring& wimFullPath,
+                           uint32_t targetIndex,
+                           const LogCallback& logCb) {
+    if (targetIndex == 0) targetIndex = 1;
+    if (TrySetWimBootIndexViaWimgapi(wimFullPath, targetIndex)) {
+        WimInspectionInfo check = InspectWimFile(wimFullPath);
+        if (check.bootIndex == targetIndex) {
+            if (logCb) {
+                logCb(L"WIM 부팅 가능 플래그(BootIndex=" + std::to_wstring(targetIndex) + L") 자동 설정 완료.");
+            }
+            return true;
+        }
+    }
+
+    std::wstring dummySig;
+    return ConvertEsdWimToBootableWim(wimFullPath, targetIndex, logCb, dummySig);
+}
+
+std::wstring DetectPreferredLoaderPathInWim(const std::wstring& wimFullPath,
+                                            uint32_t imageIndex,
+                                            bool isUefi,
+                                            const std::wstring& currentLoaderPath) {
+    if (imageIndex == 0) imageIndex = 1;
+
+    HMODULE hWimDll = LoadLibraryW(L"wimgapi.dll");
+    if (!hWimDll) return L"";
+
+    using FnWIMCreateFile       = HANDLE(WINAPI*)(PCWSTR, DWORD, DWORD, DWORD, DWORD, PDWORD);
+    using FnWIMSetTempPath      = BOOL(WINAPI*)(HANDLE, PCWSTR);
+    using FnWIMLoadImage        = HANDLE(WINAPI*)(HANDLE, DWORD);
+    using FnWIMExtractImagePath = BOOL(WINAPI*)(HANDLE, PCWSTR, PCWSTR, DWORD);
+    using FnWIMCloseHandle      = BOOL(WINAPI*)(HANDLE);
+
+    auto pCreate  = reinterpret_cast<FnWIMCreateFile>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCreateFile")));
+    auto pSetTemp = reinterpret_cast<FnWIMSetTempPath>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMSetTemporaryPath")));
+    auto pLoad    = reinterpret_cast<FnWIMLoadImage>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMLoadImage")));
+    auto pExtract = reinterpret_cast<FnWIMExtractImagePath>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMExtractImagePath")));
+    auto pClose   = reinterpret_cast<FnWIMCloseHandle>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCloseHandle")));
+
+    std::wstring detected;
+    if (pCreate && pLoad && pExtract && pClose) {
+        DWORD cr = 0;
+        HANDLE hWim = pCreate(wimFullPath.c_str(), GENERIC_READ, OPEN_EXISTING, 0, 0, &cr);
+        if (hWim && hWim != INVALID_HANDLE_VALUE) {
+            wchar_t tmpDir[MAX_PATH]{};
+            if (GetTempPathW(MAX_PATH, tmpDir) > 0) {
+                if (pSetTemp) pSetTemp(hWim, tmpDir);
+
+                HANDLE hImg = pLoad(hWim, imageIndex);
+                if (hImg && hImg != INVALID_HANDLE_VALUE) {
+                    std::wstring probeDst = JoinPath(tmpDir, L"otpe_loader_probe.tmp");
+                    auto probePath = [&](const std::wstring& relPath) -> bool {
+                        DeleteFileW(probeDst.c_str());
+                        BOOL ok = pExtract(hImg, relPath.c_str(), probeDst.c_str(), 0);
+                        if (!ok && !relPath.empty() && relPath.front() == L'\\') {
+                            ok = pExtract(hImg, relPath.substr(1).c_str(), probeDst.c_str(), 0);
+                        }
+                        bool exists = ok && (GetFileAttributesW(probeDst.c_str()) != INVALID_FILE_ATTRIBUTES);
+                        DeleteFileW(probeDst.c_str());
+                        return exists;
+                    };
+
+                    const std::wstring stdPath  = isUefi ? L"\\Windows\\System32\\winload.efi"
+                                                         : L"\\Windows\\System32\\winload.exe";
+                    const std::wstring bootPath = isUefi ? L"\\Windows\\System32\\Boot\\winload.efi"
+                                                         : L"\\Windows\\System32\\Boot\\winload.exe";
+
+                    bool curOk = !currentLoaderPath.empty() && probePath(currentLoaderPath);
+                    if (!curOk) {
+                        if (probePath(stdPath)) {
+                            detected = isUefi ? L"\\windows\\system32\\winload.efi"
+                                              : L"\\windows\\system32\\winload.exe";
+                        } else if (probePath(bootPath)) {
+                            detected = isUefi ? L"\\windows\\system32\\boot\\winload.efi"
+                                              : L"\\windows\\system32\\boot\\winload.exe";
+                        }
+                    }
+                    pClose(hImg);
+                }
+            }
+            pClose(hWim);
+        }
+    }
+
+    FreeLibrary(hWimDll);
+    return detected;
+}
+
 bool ExportNetworkConfigForPe(const std::wstring& appDir,
                               const std::wstring& appBcdRelDir,
                               bool exportDrivers,
@@ -875,6 +1181,20 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
         SetFileAttributesW(wimFullPath.c_str(), wimAttr & ~FILE_ATTRIBUTE_READONLY);
     }
 
+    // 0. If the file is actually LZMS/ESD compressed, convert it to a standard mountable/bootable WIM first
+    WimInspectionInfo preCheck = InspectWimFile(wimFullPath);
+    if (preCheck.validWimMagic && preCheck.isLzmsEsd) {
+        if (logCb) {
+            logCb(L"알림: ESD(LZMS 고압축) 포맷이 감지되어 먼저 RAMDisk 부팅 및 마운트가 가능한 표준 WIM으로 변환합니다...");
+        }
+        uint32_t srcIdx = (preCheck.bootIndex > 0) ? preCheck.bootIndex
+                                                   : ((preCheck.imageCount > 0) ? preCheck.imageCount : 1u);
+        std::wstring convSig;
+        if (!ConvertEsdWimToBootableWim(wimFullPath, srcIdx, logCb, convSig)) {
+            return false;
+        }
+    }
+
     // 1. Inspect WIM image indices via DISM (/English for deterministic parsing)
     if (logCb) logCb(L"--- WIM 무인 네트워크 자동 실행 패치 시작 ---");
     ExecOutput infoRes = RunHiddenProcess(L"dism.exe",
@@ -902,6 +1222,12 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
     if (indices.empty()) indices.push_back(1);
 
     std::wstring mountDir = JoinPath(appDir, L"_wim_mount_tmp");
+    {
+        wchar_t winDir[MAX_PATH]{};
+        if (GetWindowsDirectoryW(winDir, MAX_PATH) > 0) {
+            mountDir = JoinPath(JoinPath(winDir, L"Temp"), L"OneTimePE_WimMount");
+        }
+    }
 
     // Clean up any stale mount state before starting
     RunHiddenProcess(L"dism.exe", L"/English /Cleanup-Mountpoints", nullptr);
@@ -1059,6 +1385,25 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
             if (logCb) logCb(L" • 후킹 완료: Default User Startup 시작프로그램 폴더");
         }
 
+        // E. Ensure both System32\winload.{efi,exe} and System32\Boot\winload.{efi,exe} exist when one is present
+        //    Prevents 0xc000000f loader path mismatch across custom / recovery WinPE builds!
+        if (patchOk) {
+            std::wstring bootSubDir = JoinPath(sys32Dir, L"Boot");
+            for (const wchar_t* loaderFile : { L"winload.efi", L"winload.exe" }) {
+                std::wstring pSys32 = JoinPath(sys32Dir, loaderFile);
+                std::wstring pBoot  = JoinPath(bootSubDir, loaderFile);
+                bool hasSys32 = (GetFileAttributesW(pSys32.c_str()) != INVALID_FILE_ATTRIBUTES);
+                bool hasBoot  = (GetFileAttributesW(pBoot.c_str()) != INVALID_FILE_ATTRIBUTES);
+                if (!hasSys32 && hasBoot) {
+                    if (CopyFileW(pBoot.c_str(), pSys32.c_str(), TRUE)) {
+                        if (logCb) logCb(std::wstring(L" • 부트 로더 경로 보정: Boot\\") + loaderFile + L" -> System32\\" + loaderFile);
+                    }
+                } else if (hasSys32 && !hasBoot && GetFileAttributesW(bootSubDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    CopyFileW(pSys32.c_str(), pBoot.c_str(), TRUE);
+                }
+            }
+        }
+
         // Unmount & Commit (or Discard on failure)
         if (logCb) {
             logCb(patchOk ? L"변경 사항을 WIM 이미지에 저장(Commit) 및 언마운트 중..."
@@ -1077,6 +1422,16 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
 
     DeleteDirectoryContentsRecursive(mountDir);
     RemoveDirectoryW(mountDir.c_str());
+
+    // Ensure WIM header has BootIndex > 0 so bootmgfw.efi can mount it as RAMDisk without 0xc000000f
+    WimInspectionInfo postCheck = InspectWimFile(wimFullPath);
+    if (postCheck.validWimMagic && postCheck.bootIndex == 0 && !indices.empty()) {
+        uint32_t targetBootIdx = static_cast<uint32_t>(indices.back());
+        TrySetWimBootIndexViaWimgapi(wimFullPath, targetBootIdx);
+        if (logCb) {
+            logCb(L" • WIM 부팅 가능 플래그(BootIndex=" + std::to_wstring(targetBootIdx) + L") 보정 적용");
+        }
+    }
 
     outNewWimSig = ComputeFileSignature(wimFullPath);
     if (logCb) logCb(L"★ WIM 무인 네트워크 자동 실행 패치가 완료되었습니다!");

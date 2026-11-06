@@ -8,6 +8,7 @@
 #define NOMINMAX
 
 #include <windows.h>
+#include <winioctl.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
+#include <cstring>
 #include <thread>
 
 #include "resource.h"
@@ -58,14 +60,31 @@ struct ResolvedFileInfo {
     std::wstring bcdRelPath;   // e.g. "\PEBoot\boot.wim"
     ULONGLONG sizeBytes        = 0;
     bool isEncryptedEfs        = false;
+    bool isCompressedNtfs      = false;
     UINT driveType             = DRIVE_UNKNOWN;
+    STORAGE_BUS_TYPE busType   = BusTypeUnknown;
+    std::wstring fileSystem;   // e.g. "NTFS", "FAT32", "exFAT"
     int bitLockerState         = -1;
 };
 
 enum class PostPatchFollowUp {
     None,
+    ContinueApplyBcdOnly,
     ContinueQueueOnly,
     ContinueBootNow
+};
+
+enum class AsyncWimTaskKind {
+    UnattendedNetPatch,
+    ConvertEsdToWim
+};
+
+struct AsyncWimTaskResult {
+    AsyncWimTaskKind  kind     = AsyncWimTaskKind::UnattendedNetPatch;
+    bool              success  = false;
+    std::wstring      wimPath;
+    std::wstring      newSig;
+    PostPatchFollowUp followUp = PostPatchFollowUp::None;
 };
 
 // Global UI state
@@ -80,10 +99,12 @@ HBRUSH    g_hBgBrush       = nullptr;
 
 std::wstring g_appDir;
 std::wstring g_iniPath;
-bool         g_isUefi          = true;
-int          g_secureBootState = -1;
-bool         g_isAdmin         = false;
-bool         g_isTaskBusy      = false;
+std::wstring g_machineId;
+bool         g_resetFromOtherPc = false;
+bool         g_isUefi           = true;
+int          g_secureBootState  = -1;
+bool         g_isAdmin          = false;
+bool         g_isTaskBusy       = false;
 AppConfig    g_cfg;
 
 // Controls
@@ -236,7 +257,7 @@ void PostLogFromWorkerThread(const std::wstring& msg) {
     }
 }
 
-void SetTaskBusyState(bool busy) {
+void SetTaskBusyState(bool busy, const wchar_t* customBtnText = nullptr) {
     g_isTaskBusy = busy;
     const HWND interactive[] = {
         g_hCmbWim, g_hBtnBrowseWim, g_hCmbSdi, g_hBtnBrowseSdi, g_hBtnGenSdi, g_hBtnRescan,
@@ -246,7 +267,11 @@ void SetTaskBusyState(bool busy) {
     for (HWND h : interactive) {
         if (h) EnableWindow(h, busy ? FALSE : TRUE);
     }
-    SetWindowTextW(g_hBtnPatchWim, busy ? L"WIM 패치 진행중..." : L"WIM 무인패치 적용");
+    if (busy) {
+        SetWindowTextW(g_hBtnPatchWim, customBtnText ? customBtnText : L"WIM 작업 진행중...");
+    } else {
+        SetWindowTextW(g_hBtnPatchWim, L"WIM 무인패치 적용");
+    }
 }
 
 bool DetectFirmwareIsUefi() {
@@ -317,7 +342,7 @@ int QueryVolumeBitLockerState(const std::wstring& driveColon) {
 
     using FnPSGetPropertyKeyFromName = HRESULT(WINAPI*)(PCWSTR, PROPERTYKEY*);
     static auto pGetKey = reinterpret_cast<FnPSGetPropertyKeyFromName>(
-        GetProcAddress(hPropSys, "PSGetPropertyKeyFromName"));
+        reinterpret_cast<void*>(GetProcAddress(hPropSys, "PSGetPropertyKeyFromName")));
     if (!pGetKey) return -1;
 
     PROPERTYKEY key{};
@@ -333,6 +358,111 @@ int QueryVolumeBitLockerState(const std::wstring& driveColon) {
     HRESULT hr = pItem->GetUInt32(key, &val);
     pItem->Release();
     return SUCCEEDED(hr) ? static_cast<int>(val) : -1;
+}
+
+std::wstring GetSystemDriveColon() {
+    wchar_t winDir[MAX_PATH]{};
+    if (GetWindowsDirectoryW(winDir, MAX_PATH) >= 2 && std::iswalpha(winDir[0]) && winDir[1] == L':') {
+        std::wstring d(winDir, 2);
+        d[0] = static_cast<wchar_t>(std::towupper(d[0]));
+        return d;
+    }
+    return L"C:";
+}
+
+std::wstring GetLocalMachineId() {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography",
+                      0, KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+        wchar_t guidBuf[128]{};
+        DWORD cb = sizeof(guidBuf);
+        DWORD type = 0;
+        LONG st = RegQueryValueExW(hKey, L"MachineGuid", nullptr, &type,
+                                   reinterpret_cast<LPBYTE>(guidBuf), &cb);
+        RegCloseKey(hKey);
+        if (st == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ) && guidBuf[0] != L'\0') {
+            return Trim(guidBuf);
+        }
+    }
+    wchar_t compBuf[MAX_COMPUTERNAME_LENGTH + 4]{};
+    DWORD len = _countof(compBuf);
+    if (GetComputerNameW(compBuf, &len) && len > 0) {
+        return std::wstring(compBuf, len);
+    }
+    return L"";
+}
+
+STORAGE_BUS_TYPE QueryVolumeStorageBusType(const std::wstring& driveColon) {
+    if (driveColon.size() < 2) return BusTypeUnknown;
+    std::wstring devPath = L"\\\\.\\" + driveColon.substr(0, 2);
+    HANDLE hVol = CreateFileW(devPath.c_str(), 0,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hVol == INVALID_HANDLE_VALUE) return BusTypeUnknown;
+
+    STORAGE_PROPERTY_QUERY spq{};
+    spq.PropertyId = StorageDeviceProperty;
+    spq.QueryType  = PropertyStandardQuery;
+
+    BYTE outBuf[512]{};
+    DWORD retBytes = 0;
+    STORAGE_BUS_TYPE bt = BusTypeUnknown;
+    if (DeviceIoControl(hVol, IOCTL_STORAGE_QUERY_PROPERTY, &spq, sizeof(spq),
+                        outBuf, sizeof(outBuf), &retBytes, nullptr) &&
+        retBytes >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(outBuf);
+        bt = desc->BusType;
+    }
+    CloseHandle(hVol);
+    return bt;
+}
+
+bool IsExternalUsbOrCardBus(STORAGE_BUS_TYPE bt) {
+    return (bt == BusTypeUsb || bt == BusTypeSd || bt == BusTypeMmc || bt == BusType1394);
+}
+
+bool IsFileBackedVirtualBus(STORAGE_BUS_TYPE bt) {
+    return (bt == BusTypeFileBackedVirtual);
+}
+
+bool IsBootSupportedFileSystem(const std::wstring& fs) {
+    if (fs.empty()) return true;
+    return (_wcsicmp(fs.c_str(), L"NTFS") == 0 ||
+            _wcsicmp(fs.c_str(), L"FAT32") == 0 ||
+            _wcsicmp(fs.c_str(), L"FAT") == 0);
+}
+
+bool HasValidSdiSignature(const std::wstring& sdiPath) {
+    HANDLE h = CreateFileW(sdiPath.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    char magic[8]{};
+    DWORD readBytes = 0;
+    BOOL ok = ReadFile(h, magic, sizeof(magic), &readBytes, nullptr);
+    CloseHandle(h);
+    if (!ok || readBytes < 8) return false;
+    return std::memcmp(magic, "$SDI0001", 8) == 0;
+}
+
+std::wstring NormalizeLoaderPathForFirmware(const std::wstring& rawLoader, bool isUefi) {
+    std::wstring loader = Trim(rawLoader);
+    if (loader.empty()) {
+        return isUefi ? L"\\windows\\system32\\winload.efi"
+                      : L"\\windows\\system32\\winload.exe";
+    }
+    for (auto& ch : loader) {
+        if (ch == L'/') ch = L'\\';
+    }
+    if (loader.front() != L'\\') loader = L"\\" + loader;
+
+    std::wstring low = ToLower(loader);
+    if (isUefi && low.size() >= 4 && low.substr(low.size() - 4) == L".exe") {
+        loader = loader.substr(0, loader.size() - 4) + L".efi";
+    } else if (!isUefi && low.size() >= 4 && low.substr(low.size() - 4) == L".efi") {
+        loader = loader.substr(0, loader.size() - 4) + L".exe";
+    }
+    return loader;
 }
 
 std::wstring GetNormalizedBcdRelativeDir(const std::wstring& dirPath) {
@@ -373,7 +503,8 @@ ResolvedFileInfo ResolvePeFile(const std::wstring& rawInput) {
     }
 
     info.exists = true;
-    info.isEncryptedEfs = (attrs & FILE_ATTRIBUTE_ENCRYPTED) != 0;
+    info.isEncryptedEfs   = (attrs & FILE_ATTRIBUTE_ENCRYPTED) != 0;
+    info.isCompressedNtfs = (attrs & FILE_ATTRIBUTE_COMPRESSED) != 0;
 
     HANDLE hFile = CreateFileW(target.c_str(), 0,
                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -408,16 +539,19 @@ ResolvedFileInfo ResolvePeFile(const std::wstring& rawInput) {
         }
         std::wstring rootSlash = info.driveColon + L"\\";
         info.driveType = GetDriveTypeW(rootSlash.c_str());
+        info.busType   = QueryVolumeStorageBusType(info.driveColon);
+        wchar_t fsBuf[64]{};
+        if (GetVolumeInformationW(rootSlash.c_str(), nullptr, 0, nullptr, nullptr, nullptr,
+                                  fsBuf, _countof(fsBuf)) && fsBuf[0] != L'\0') {
+            info.fileSystem = fsBuf;
+        }
         info.bitLockerState = QueryVolumeBitLockerState(info.driveColon);
     }
     return info;
 }
 
 bool IsWimCurrentlyPatched(const ResolvedFileInfo& wimInfo) {
-    if (!wimInfo.exists || g_cfg.patchedWimPath.empty() || g_cfg.patchedWimSig.empty()) {
-        return false;
-    }
-    if (_wcsicmp(wimInfo.fullPath.c_str(), g_cfg.patchedWimPath.c_str()) != 0) {
+    if (!wimInfo.exists || g_cfg.patchedWimSig.empty()) {
         return false;
     }
     std::wstring curSig = net_sync::ComputeFileSignature(wimInfo.fullPath);
@@ -603,11 +737,11 @@ void LoadConfigFromIni() {
         return;
     }
 
+    std::wstring savedMachineId = ReadIniStr(L"MachineId", L"");
     g_cfg.wimInput             = ReadIniStr(L"WimFile", L"boot.wim");
     g_cfg.sdiInput             = ReadIniStr(L"SdiFile", L"boot.sdi");
     g_cfg.description          = ReadIniStr(L"Description", L"One-Time WinPE");
-    g_cfg.loaderPath           = ReadIniStr(L"LoaderPath", defaultLoader);
-    if (g_cfg.loaderPath.empty()) g_cfg.loaderPath = defaultLoader;
+    g_cfg.loaderPath           = NormalizeLoaderPathForFirmware(ReadIniStr(L"LoaderPath", defaultLoader), g_isUefi);
     g_cfg.systemRoot           = ReadIniStr(L"SystemRoot", L"\\windows");
     g_cfg.winpeMode            = ReadIniInt(L"WinPEMode", 1) != 0;
     g_cfg.detectHal            = ReadIniInt(L"DetectHal", 1) != 0;
@@ -622,6 +756,21 @@ void LoadConfigFromIni() {
     g_cfg.patchedWimSig        = ReadIniStr(L"PatchedWimSig", L"");
     g_cfg.sdiGuid              = ReadIniStr(L"SdiGuid", L"");
     g_cfg.peGuid               = ReadIniStr(L"PeGuid", L"");
+
+    // If copied from another PC, clear stale BCD GUIDs and reset loader path to match current firmware
+    if (!g_machineId.empty() && !savedMachineId.empty() &&
+        _wcsicmp(savedMachineId.c_str(), g_machineId.c_str()) != 0) {
+        g_cfg.sdiGuid.clear();
+        g_cfg.peGuid.clear();
+        g_cfg.loaderPath = defaultLoader;
+        if (ToLower(g_cfg.wimInput).find(L"onetimepe_cache") != std::wstring::npos) {
+            g_cfg.wimInput = L"boot.wim";
+        }
+        if (ToLower(g_cfg.sdiInput).find(L"onetimepe_cache") != std::wstring::npos) {
+            g_cfg.sdiInput = L"boot.sdi";
+        }
+        g_resetFromOtherPc = true;
+    }
 }
 
 void PullControlsToConfig() {
@@ -668,6 +817,9 @@ bool SaveConfigToIni(bool logSaved = true) {
     PullControlsToConfig();
     EnsureUnicodeIniFileExists();
 
+    if (!g_machineId.empty()) {
+        WriteIniStr(L"MachineId", g_machineId);
+    }
     WriteIniStr(L"WimFile", g_cfg.wimInput);
     WriteIniStr(L"SdiFile", g_cfg.sdiInput);
     WriteIniStr(L"Description", g_cfg.description);
@@ -754,7 +906,19 @@ void UpdateFileStatusBanner() {
     if (wimInfo.exists) {
         wchar_t szBuf[64];
         swprintf_s(szBuf, L"%.1f MB", static_cast<double>(wimInfo.sizeBytes) / (1024.0 * 1024.0));
-        status += L"[WIM 인식됨: " + std::wstring(szBuf) + L"]";
+        net_sync::WimInspectionInfo wi = net_sync::InspectWimFile(wimInfo.fullPath);
+        if (!wi.validWimMagic) {
+            status += L"[⚠ 손상/비정상 WIM 헤더!]";
+        } else if (wi.isLzmsEsd) {
+            status += L"[⚠ ESD(LZMS) 압축: " + std::wstring(szBuf) + L" - 표준WIM 변환 필요]";
+        } else if (g_isUefi && wi.arch == 0) {
+            status += L"[⚠ 32비트(x86) WIM: UEFI 부팅 불가!]";
+        } else {
+            std::wstring archTag = (wi.arch == 9) ? L", x64" : ((wi.arch == 0) ? L", x86" : L"");
+            if (wi.osBuild > 0) archTag += L" Build " + std::to_wstring(wi.osBuild);
+            if (wi.bootIndex == 0) archTag += L", BootFlag보정예정";
+            status += L"[WIM: " + std::wstring(szBuf) + archTag + L"]";
+        }
     } else {
         status += L"[WIM 파일 없음 - 같은 폴더에 .wim 파일을 넣어주세요]";
     }
@@ -762,9 +926,13 @@ void UpdateFileStatusBanner() {
     status += L"  |  ";
 
     if (sdiInfo.exists) {
-        wchar_t szBuf[64];
-        swprintf_s(szBuf, L"%.1f MB", static_cast<double>(sdiInfo.sizeBytes) / (1024.0 * 1024.0));
-        status += L"[SDI 인식됨: " + std::wstring(szBuf) + L"]";
+        if (!HasValidSdiSignature(sdiInfo.fullPath)) {
+            status += L"[⚠ 손상된 SDI 파일 - '내장 SDI 생성' 필요]";
+        } else {
+            wchar_t szBuf[64];
+            swprintf_s(szBuf, L"%.1f MB", static_cast<double>(sdiInfo.sizeBytes) / (1024.0 * 1024.0));
+            status += L"[SDI: " + std::wstring(szBuf) + L"]";
+        }
     } else {
         status += L"[SDI 파일 없음 - 우측 '내장 SDI 생성' 클릭 가능]";
     }
@@ -772,19 +940,28 @@ void UpdateFileStatusBanner() {
     std::wstring targetDrive = wimInfo.exists ? wimInfo.driveColon
                              : (sdiInfo.exists ? sdiInfo.driveColon : GetAppDirDriveColon());
     UINT targetDrvType = DRIVE_UNKNOWN;
+    STORAGE_BUS_TYPE targetBus = BusTypeUnknown;
     int blState = -1;
     if (!targetDrive.empty()) {
         std::wstring rootSlash = targetDrive + L"\\";
         targetDrvType = GetDriveTypeW(rootSlash.c_str());
-        blState = QueryVolumeBitLockerState(targetDrive);
+        targetBus     = QueryVolumeStorageBusType(targetDrive);
+        blState       = QueryVolumeBitLockerState(targetDrive);
+        wchar_t fsBuf[64]{};
+        GetVolumeInformationW(rootSlash.c_str(), nullptr, 0, nullptr, nullptr, nullptr, fsBuf, _countof(fsBuf));
+        std::wstring fsStr = fsBuf;
 
-        status += L"  |  볼륨 [" + targetDrive + L"] ";
-        if (targetDrvType == DRIVE_FIXED) {
-            status += L"(내장 고정 디스크)";
-        } else if (targetDrvType == DRIVE_REMOVABLE) {
-            status += L"(주의: 이동식 드라이브)";
+        status += L"  |  [" + targetDrive + L"] ";
+        if (IsExternalUsbOrCardBus(targetBus) || targetDrvType == DRIVE_REMOVABLE) {
+            status += L"(⚠ USB/외장 디스크 - 부팅 시 내장 캐시 자동 복사 지원)";
+        } else if (!IsBootSupportedFileSystem(fsStr)) {
+            status += L"(⚠ " + fsStr + L" 포맷 - 부트매니저 미지원, 내장 캐시 복사 지원)";
+        } else if (IsFileBackedVirtualBus(targetBus) || targetDrvType == DRIVE_CDROM) {
+            status += L"(⚠ 가상 VHD/ISO 드라이브 - 내장 캐시 복사 지원)";
+        } else if (targetDrvType == DRIVE_FIXED) {
+            status += L"(내장 고정 디스크" + (fsStr.empty() ? L"" : (L" · " + fsStr)) + L")";
         } else {
-            status += L"(주의: 특수 드라이브)";
+            status += L"(⚠ 특수 드라이브)";
         }
     }
 
@@ -794,7 +971,7 @@ void UpdateFileStatusBanner() {
         g_secureBootState = DetectSecureBootState();
         std::wstring secTxt;
         if (!targetDrive.empty()) {
-            if (blState == 1 || blState == 6) {
+            if (blState == 1 || blState == 3 || blState == 6) {
                 secTxt += L"⚠ [" + targetDrive + L"] BitLocker: " + DescribeBitLockerState(blState);
             } else {
                 secTxt += L"✔ [" + targetDrive + L"] BitLocker: " + DescribeBitLockerState(blState);
@@ -805,7 +982,7 @@ void UpdateFileStatusBanner() {
 
         secTxt += L"  |  Secure Boot: ";
         if (g_secureBootState == 1) {
-            secTxt += L"켜짐 (정식 서명 PE 가능)";
+            secTxt += L"켜짐 (구형/개조 PE는 차단될 수 있음)";
         } else if (g_secureBootState == 0) {
             secTxt += L"꺼짐";
         } else {
@@ -836,13 +1013,14 @@ void ActionCheckBitLockerAndSecureBoot() {
         report += L" • 펌웨어 모드: Legacy BIOS (Secure Boot 해당 없음)\n\n";
     } else if (g_secureBootState == 1) {
         report += L" • 펌웨어 모드: UEFI  |  Secure Boot: 켜짐 (Enabled)\n";
-        report += L" • 호환성 안내: 정품 Windows 부트 매니저를 사용하므로 Microsoft 서명이 유지된 표준/최신 WinPE는 Secure Boot가 켜진 상태에서도 정상 부팅됩니다. (서명이 변조된 일부 구형 개조 PE만 차단됨)\n\n";
+        report += L" • 호환성 안내: 정품 Microsoft 서명이 유지된 최신 Windows 11 기반 WinPE는 Secure Boot가 켜진 상태에서도 정상 부팅됩니다.\n";
+        report += L"   (단, 최신 보안 업데이트 KB5025885 등이 적용된 노트북에서는 구형 Win10 PE나 개조 PE의 winload.efi가 0xc000000f / 0xc0000428로 차단될 수 있으므로, 해당 시 Win11 PE를 사용하거나 Secure Boot를 잠시 꺼주세요.)\n\n";
     } else {
         report += L" • 펌웨어 모드: UEFI  |  Secure Boot: 꺼짐 (Disabled)\n";
         report += L" • 호환성 안내: 서명 제한 없이 모든 UEFI WinPE 부팅이 가능합니다.\n\n";
     }
 
-    report += L"[2] 전체 드라이브 BitLocker 설정 현황\n";
+    report += L"[2] 전체 드라이브 BitLocker 및 버스(내장/USB) 현황\n";
     wchar_t drvStrings[512]{};
     DWORD len = GetLogicalDriveStringsW(_countof(drvStrings) - 1, drvStrings);
     const wchar_t* p = drvStrings;
@@ -855,12 +1033,19 @@ void ActionCheckBitLockerAndSecureBoot() {
             wchar_t volLabel[128]{};
             GetVolumeInformationW(root.c_str(), volLabel, _countof(volLabel),
                                   nullptr, nullptr, nullptr, fsName, _countof(fsName));
+            STORAGE_BUS_TYPE bus = QueryVolumeStorageBusType(dColon);
             int st = QueryVolumeBitLockerState(dColon);
             std::wstring line = L" • " + dColon + L" ";
             if (volLabel[0] != L'\0') line += L"(" + std::wstring(volLabel) + L", ";
             else line += L"(";
             line += (fsName[0] != L'\0' ? std::wstring(fsName) : L"알수없음");
-            line += (dtype == DRIVE_FIXED ? L", 내장) : " : L", 이동식) : ");
+            if (IsExternalUsbOrCardBus(bus) || dtype == DRIVE_REMOVABLE) {
+                line += L", USB/외장) : ";
+            } else if (IsFileBackedVirtualBus(bus)) {
+                line += L", 가상VHD/ISO) : ";
+            } else {
+                line += L", 내장) : ";
+            }
             line += DescribeBitLockerState(st);
             if (_wcsicmp(dColon.c_str(), targetDrive.c_str()) == 0) {
                 line += L"  ◀ [현재 PE 대상 볼륨]";
@@ -875,9 +1060,9 @@ void ActionCheckBitLockerAndSecureBoot() {
     if (!targetDrive.empty() && g_isAdmin) {
         CmdResult bdeRes = RunSystemTool(L"manage-bde.exe", L"-status " + targetDrive, true);
         report += L"\n[3] 대상 볼륨 (" + targetDrive + L") 상세 진단 결과\n";
-        if (targetBlState == 1) {
+        if (targetBlState == 1 || targetBlState == 3) {
             report += L" ⚠ 판정: BitLocker 암호화 및 보호가 [켜져 있음]\n";
-            report += L" → 조치: PE 부팅 시 파일을 읽으려면 '재부팅 전 BitLocker 보호 일시 중지' 옵션을 체크하세요.\n";
+            report += L" → 조치: PE 부팅 시 0xc000000f 오류 없이 파일을 읽으려면 '재부팅 전 BitLocker 보호 일시 중지' 옵션을 체크하세요.\n";
         } else if (targetBlState == 5) {
             report += L" ✔ 판정: BitLocker가 설정되어 있으나 현재 [보호 일시 중지됨]\n";
             report += L" → 조치: 추가 해제 없이 바로 1회성 PE 부팅이 가능합니다.\n";
@@ -911,7 +1096,7 @@ void ActionCheckBitLockerAndSecureBoot() {
         }
     }
 
-    if (targetBlState == 1 && SendMessageW(g_hChkBitLocker, BM_GETCHECK, 0, 0) != BST_CHECKED) {
+    if ((targetBlState == 1 || targetBlState == 3) && SendMessageW(g_hChkBitLocker, BM_GETCHECK, 0, 0) != BST_CHECKED) {
         report += L"\n지금 '재부팅 전 BitLocker 보호 일시 중지' 체크박스를 자동으로 켜드릴까요?";
         int ans = MessageBoxW(g_hMainWnd, report.c_str(),
                               L"BitLocker 및 Secure Boot 상태 확인 결과",
@@ -927,12 +1112,13 @@ void ActionCheckBitLockerAndSecureBoot() {
     }
 }
 
-void ActionSyncWindowsNetworkNow(bool showMessageBox) {
+void ActionSyncWindowsNetworkNow(bool showMessageBox, const std::wstring& targetDirOverride = L"") {
     PullControlsToConfig();
-    std::wstring relAppDir = GetNormalizedBcdRelativeDir(g_appDir);
+    std::wstring exportBaseDir = targetDirOverride.empty() ? g_appDir : targetDirOverride;
+    std::wstring relAppDir     = GetNormalizedBcdRelativeDir(exportBaseDir);
     std::wstring summary;
     bool ok = net_sync::ExportNetworkConfigForPe(
-        g_appDir, relAppDir, g_cfg.exportNicDrivers,
+        exportBaseDir, relAppDir, g_cfg.exportNicDrivers,
         [](const std::wstring& m) { AppendLog(m); },
         summary);
 
@@ -964,7 +1150,7 @@ void StartAsyncWimPatch(PostPatchFollowUp followUp) {
         std::wstring ask =
             L"선택한 WIM 이미지에 '무인 네트워크 자동 실행 패치'를 적용하시겠습니까?\n\n"
             L"• 대상 파일: " + wimInfo.fullPath + L"\n"
-            L"• 수행 작업: DISM 마운트 → startnet.cmd / winpeshl.ini / Startup 자동 실행 훅 주입 → 저장(Commit)\n"
+            L"• 수행 작업: DISM 마운트 → startnet.cmd / winpeshl.ini / Startup 자동 실행 훅 + 부트 로더 보정 → 저장(Commit)\n"
             L"• 최초 1회만 적용하면 이후에는 재패치 없이 매 부팅마다 최신 네트워크가 자동 연결됩니다.\n\n"
             L"계속하시겠습니까? (약 20~60초 소요)";
         if (MessageBoxW(g_hMainWnd, ask.c_str(), L"WIM 무인 자동 실행 패치 확인",
@@ -973,23 +1159,37 @@ void StartAsyncWimPatch(PostPatchFollowUp followUp) {
         }
     }
 
-    SetTaskBusyState(true);
+    SetTaskBusyState(true, L"WIM 패치 진행중...");
     std::wstring appDirCopy  = g_appDir;
     std::wstring wimPathCopy = wimInfo.fullPath;
 
-    struct PatchDonePayload {
-        bool success = false;
-        std::wstring wimPath;
-        std::wstring newSig;
-        PostPatchFollowUp followUp = PostPatchFollowUp::None;
-    };
-
     std::thread([appDirCopy, wimPathCopy, followUp]() {
-        auto* payload = new PatchDonePayload();
+        auto* payload = new AsyncWimTaskResult();
+        payload->kind     = AsyncWimTaskKind::UnattendedNetPatch;
         payload->wimPath  = wimPathCopy;
         payload->followUp = followUp;
         payload->success  = net_sync::PatchBootWimUnattended(
             appDirCopy, wimPathCopy,
+            [](const std::wstring& m) { PostLogFromWorkerThread(m); },
+            payload->newSig);
+
+        if (!PostMessageW(g_hMainWnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
+        }
+    }).detach();
+}
+
+void StartAsyncEsdConvert(const std::wstring& wimFullPath, uint32_t sourceIndex, PostPatchFollowUp followUp) {
+    if (g_isTaskBusy) return;
+    SetTaskBusyState(true, L"ESD→WIM 변환중...");
+
+    std::thread([wimFullPath, sourceIndex, followUp]() {
+        auto* payload = new AsyncWimTaskResult();
+        payload->kind     = AsyncWimTaskKind::ConvertEsdToWim;
+        payload->wimPath  = wimFullPath;
+        payload->followUp = followUp;
+        payload->success  = net_sync::ConvertEsdWimToBootableWim(
+            wimFullPath, sourceIndex,
             [](const std::wstring& m) { PostLogFromWorkerThread(m); },
             payload->newSig);
 
@@ -1126,7 +1326,8 @@ void BrowseForFile(HWND hTargetCombo, const wchar_t* filter, const wchar_t* titl
     HMODULE hComDlg = LoadLibraryW(L"comdlg32.dll");
     if (!hComDlg) return;
     using FnGetOpenFileNameW = BOOL(WINAPI*)(LPOPENFILENAMEW);
-    auto pOpenDlg = reinterpret_cast<FnGetOpenFileNameW>(GetProcAddress(hComDlg, "GetOpenFileNameW"));
+    auto pOpenDlg = reinterpret_cast<FnGetOpenFileNameW>(
+        reinterpret_cast<void*>(GetProcAddress(hComDlg, "GetOpenFileNameW")));
     if (pOpenDlg) {
         wchar_t fileBuf[MAX_PATH]{};
         OPENFILENAMEW ofn{};
@@ -1148,8 +1349,117 @@ void BrowseForFile(HWND hTargetCombo, const wchar_t* filter, const wchar_t* titl
     FreeLibrary(hComDlg);
 }
 
-bool ValidateInputsAndFiles(ResolvedFileInfo& outWim, ResolvedFileInfo& outSdi) {
+void RemoveDirectoryTree(const std::wstring& dirPath) {
+    DWORD attr = GetFileAttributesW(dirPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) return;
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(JoinPath(dirPath, L"*").c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+            std::wstring full = JoinPath(dirPath, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
+                SetFileAttributesW(full.c_str(), fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+            }
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                RemoveDirectoryTree(full);
+            } else {
+                DeleteFileW(full.c_str());
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+    }
+    RemoveDirectoryW(dirPath.c_str());
+}
+
+bool StageFilesToInternalCache(ResolvedFileInfo& ioWim, ResolvedFileInfo& ioSdi) {
+    std::wstring sysDrv = GetSystemDriveColon();
+    if (sysDrv.empty()) return false;
+    std::wstring cacheDir = sysDrv + L"\\OneTimePE_Cache";
+    CreateDirectoryW(cacheDir.c_str(), nullptr);
+
+    DWORD dirAttr = GetFileAttributesW(cacheDir.c_str());
+    if (dirAttr != INVALID_FILE_ATTRIBUTES && (dirAttr & FILE_ATTRIBUTE_COMPRESSED)) {
+        RunSystemTool(L"compact.exe", L"/u /s:\"" + cacheDir + L"\"", false);
+    }
+
+    auto extractFileName = [](const std::wstring& p, const wchar_t* fallback) -> std::wstring {
+        size_t pos = p.find_last_of(L"\\/");
+        std::wstring name = (pos == std::wstring::npos) ? p : p.substr(pos + 1);
+        return name.empty() ? std::wstring(fallback) : name;
+    };
+
+    auto stageOne = [&](const std::wstring& srcFull, const wchar_t* fallbackName, std::wstring& outDstFull) -> bool {
+        outDstFull = JoinPath(cacheDir, extractFileName(srcFull, fallbackName));
+        if (_wcsicmp(srcFull.c_str(), outDstFull.c_str()) == 0) return true;
+
+        std::wstring srcSig = net_sync::ComputeFileSignature(srcFull);
+        std::wstring dstSig = net_sync::ComputeFileSignature(outDstFull);
+        if (!srcSig.empty() && srcSig == dstSig) {
+            AppendLog(L"내장 캐시에 동일한 파일이 이미 준비되어 있어 복사를 건너뜁니다: " + outDstFull);
+            return true;
+        }
+
+        DWORD dstAttr = GetFileAttributesW(outDstFull.c_str());
+        if (dstAttr != INVALID_FILE_ATTRIBUTES && (dstAttr & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(outDstFull.c_str(), dstAttr & ~FILE_ATTRIBUTE_READONLY);
+        }
+
+        AppendLog(L"내장 시스템 드라이브로 부팅 이미지 복사 중 (잠시만 기다려 주세요): " + srcFull + L" -> " + outDstFull);
+        UpdateWindow(g_hEdtLog);
+        HCURSOR prevCur = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        BOOL copied = CopyFileW(srcFull.c_str(), outDstFull.c_str(), FALSE);
+        SetCursor(prevCur);
+        if (!copied) {
+            DWORD err = GetLastError();
+            wchar_t errMsg[512];
+            swprintf_s(errMsg,
+                       L"내장 드라이브(%s)로 파일 복사에 실패했습니다. (오류 코드: %lu)\n시스템 드라이브 여유 공간을 확인해 주세요.",
+                       outDstFull.c_str(), err);
+            AppendLog(errMsg);
+            MessageBoxW(g_hMainWnd, errMsg, L"내장 캐시 복사 실패", MB_ICONERROR | MB_OK);
+            return false;
+        }
+
+        DWORD newAttr = GetFileAttributesW(outDstFull.c_str());
+        if (newAttr != INVALID_FILE_ATTRIBUTES && (newAttr & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(outDstFull.c_str(), newAttr & ~FILE_ATTRIBUTE_READONLY);
+        }
+        if (newAttr != INVALID_FILE_ATTRIBUTES && (newAttr & FILE_ATTRIBUTE_COMPRESSED)) {
+            RunSystemTool(L"compact.exe", L"/u \"" + outDstFull + L"\"", false);
+        }
+        return true;
+    };
+
+    std::wstring dstSdi, dstWim;
+    if (!stageOne(ioSdi.fullPath, L"boot.sdi", dstSdi)) return false;
+    if (!stageOne(ioWim.fullPath, L"boot.wim", dstWim)) return false;
+
+    SetWindowTextW(g_hCmbSdi, dstSdi.c_str());
+    SetWindowTextW(g_hCmbWim, dstWim.c_str());
     PullControlsToConfig();
+
+    ioSdi = ResolvePeFile(g_cfg.sdiInput);
+    ioWim = ResolvePeFile(g_cfg.wimInput);
+    UpdateFileStatusBanner();
+    return ioSdi.exists && ioWim.exists;
+}
+
+bool ValidateInputsAndFiles(ResolvedFileInfo& outWim,
+                            ResolvedFileInfo& outSdi,
+                            PostPatchFollowUp esdFollowUp = PostPatchFollowUp::None) {
+    PullControlsToConfig();
+
+    // 1. Auto-normalize loader path for current firmware (UEFI .efi vs Legacy BIOS .exe)
+    std::wstring normLoader = NormalizeLoaderPathForFirmware(g_cfg.loaderPath, g_isUefi);
+    if (_wcsicmp(normLoader.c_str(), g_cfg.loaderPath.c_str()) != 0) {
+        AppendLog(L"현재 펌웨어 모드(" + std::wstring(g_isUefi ? L"UEFI" : L"Legacy BIOS") +
+                  L")에 맞춰 부트 로더 경로 자동 보정: " + g_cfg.loaderPath + L" -> " + normLoader);
+        g_cfg.loaderPath = normLoader;
+        SetWindowTextW(g_hCmbLoader, g_cfg.loaderPath.c_str());
+    }
+
     outWim = ResolvePeFile(g_cfg.wimInput);
     outSdi = ResolvePeFile(g_cfg.sdiInput);
 
@@ -1171,9 +1481,23 @@ bool ValidateInputsAndFiles(ResolvedFileInfo& outWim, ResolvedFileInfo& outSdi) 
         if (!outSdi.exists) return false;
     }
 
+    if (!HasValidSdiSignature(outSdi.fullPath)) {
+        int ans = MessageBoxW(
+            g_hMainWnd,
+            (L"선택한 SDI 파일이 손상되었거나 올바른 RAMDisk SDI 포맷($SDI0001)이 아닙니다:\n" + outSdi.fullPath +
+             L"\n\n손상된 SDI 파일은 부팅 시 0xc000000f 오류를 유발합니다.\n지금 정상 Windows 내장 boot.sdi로 교체할까요?").c_str(),
+            L"손상된 boot.sdi 감지", MB_ICONWARNING | MB_YESNO);
+        if (ans == IDYES) {
+            CopyBuiltInBootSdi();
+            PullControlsToConfig();
+            outSdi = ResolvePeFile(g_cfg.sdiInput);
+        }
+        if (!outSdi.exists || !HasValidSdiSignature(outSdi.fullPath)) return false;
+    }
+
     if (outWim.driveColon.empty() || outSdi.driveColon.empty()) {
         MessageBoxW(g_hMainWnd,
-                    L"네트워크 경로(UNC)에서는 부트 매니저가 파일을 읽을 수 없습니다. 로컬 내장 드라이브에서 실행해 주세요.",
+                    L"네트워크 경로(UNC)에서는 부트 매니저가 파일을 읽을 수 없습니다. 로컬 드라이브에서 실행해 주세요.",
                     L"지원되지 않는 경로", MB_ICONERROR | MB_OK);
         return false;
     }
@@ -1185,18 +1509,160 @@ bool ValidateInputsAndFiles(ResolvedFileInfo& outWim, ResolvedFileInfo& outSdi) 
         return false;
     }
 
-    if (outWim.driveType != DRIVE_FIXED || outSdi.driveType != DRIVE_FIXED) {
-        int ans = MessageBoxW(g_hMainWnd,
-                              L"현재 파일이 내장 고정 디스크(Fixed Disk)가 아닌 드라이브에 위치해 있습니다.\n그래도 계속 진행하시겠습니까?",
-                              L"드라이브 유형 확인", MB_ICONWARNING | MB_YESNO);
-        if (ans != IDYES) return false;
+    // 2. Check USB / external drive / exFAT / virtual VHD-ISO BEFORE modifying WIM so read-only/USB media can stage cleanly to C:\OneTimePE_Cache
+    bool onExternalUsb = IsExternalUsbOrCardBus(outWim.busType) || IsExternalUsbOrCardBus(outSdi.busType) ||
+                         (outWim.driveType == DRIVE_REMOVABLE) || (outSdi.driveType == DRIVE_REMOVABLE);
+    bool onVirtualDisk = IsFileBackedVirtualBus(outWim.busType) || IsFileBackedVirtualBus(outSdi.busType) ||
+                         (outWim.driveType == DRIVE_CDROM) || (outSdi.driveType == DRIVE_CDROM);
+    bool onUnsupportedFs = !IsBootSupportedFileSystem(outWim.fileSystem) || !IsBootSupportedFileSystem(outSdi.fileSystem);
+    bool nonFixedOther   = (outWim.driveType != DRIVE_FIXED) || (outSdi.driveType != DRIVE_FIXED);
+
+    if (onExternalUsb || onVirtualDisk || onUnsupportedFs || nonFixedOther) {
+        std::wstring sysDrv = GetSystemDriveColon();
+        STORAGE_BUS_TYPE sysBus = QueryVolumeStorageBusType(sysDrv);
+        bool canStageInternal = !sysDrv.empty() && !IsExternalUsbOrCardBus(sysBus);
+
+        std::wstring reason;
+        if (onVirtualDisk) {
+            reason = L"현재 PE 파일이 [마운트된 가상 드라이브(ISO/VHD)]에 위치해 있습니다.\n재부팅하면 마운트가 해제되어 100% 부팅 오류(0xc000000f)가 발생합니다.";
+        } else if (onUnsupportedFs) {
+            std::wstring badFs = !IsBootSupportedFileSystem(outWim.fileSystem) ? outWim.fileSystem : outSdi.fileSystem;
+            reason = L"현재 PE 파일이 [" + badFs + L" 파일 시스템] 볼륨에 위치해 있습니다.\nWindows 부트 매니저는 NTFS/FAT32만 읽을 수 있어 " + badFs + L" 볼륨에서는 0xc000000f 오류가 발생합니다.";
+        } else if (onExternalUsb) {
+            reason = L"현재 PE 파일이 [USB 메모리 / 외장 디스크(" + outWim.driveColon + L")]에 위치해 있습니다.\n삼성 노트북 등 UEFI Fast Boot 환경에서는 내장 부트 매니저가 재부팅 초기 단계에 외장 USB 볼륨을 열지 못해 \\windows\\system32\\winload.efi (0xc000000f) 오류가 발생합니다.";
+        } else {
+            reason = L"현재 PE 파일이 표준 내장 고정 디스크가 아닌 볼륨(" + outWim.driveColon + L")에 위치해 있습니다.";
+        }
+
+        if (canStageInternal) {
+            std::wstring askMsg =
+                reason + L"\n\n"
+                L"• [예(Y) - 강력 권장] : 내장 시스템 드라이브(" + sysDrv + L"\\OneTimePE_Cache)로 PE 파일을 자동 복사하여 0xc000000f 오류 없이 안전하게 진행합니다.\n"
+                L"• [아니오(N)] : 복사하지 않고 현재 경로 그대로 강제 진행합니다.\n"
+                L"• [취소] : 작업을 중단합니다.";
+            int ans = MessageBoxW(g_hMainWnd, askMsg.c_str(),
+                                  L"외장/특수 드라이브 부팅 오류(0xc000000f) 방지 안내",
+                                  MB_ICONWARNING | MB_YESNOCANCEL);
+            if (ans == IDCANCEL) return false;
+            if (ans == IDYES) {
+                if (!StageFilesToInternalCache(outWim, outSdi)) return false;
+            } else if (onVirtualDisk || onUnsupportedFs) {
+                MessageBoxW(g_hMainWnd,
+                            L"가상 드라이브(ISO/VHD) 및 exFAT 볼륨은 부트 매니저가 직접 부팅할 수 없습니다.\n내장 드라이브 자동 복사([예])를 선택하거나 NTFS 내장 드라이브에 복사 후 실행해 주세요.",
+                            L"직접 부팅 불가 볼륨", MB_ICONERROR | MB_OK);
+                return false;
+            }
+        } else {
+            int ans = MessageBoxW(g_hMainWnd,
+                                  (reason + L"\n\n그래도 현재 드라이브에서 강제로 계속 진행하시겠습니까?").c_str(),
+                                  L"드라이브 호환성 경고", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+            if (ans != IDYES) return false;
+        }
+    }
+
+    // 3. Ensure NTFS-compressed WIM/SDI files are uncompressed (NTFS compression breaks bootmgfw RAMDisk with 0xc000000f)
+    if (outWim.isCompressedNtfs || outSdi.isCompressedNtfs) {
+        AppendLog(L"WIM/SDI 파일에 NTFS 압축 속성이 감지되어 RAMDisk 부팅 오류 방지를 위해 압축을 해제합니다...");
+        if (outSdi.isCompressedNtfs) RunSystemTool(L"compact.exe", L"/u \"" + outSdi.fullPath + L"\"");
+        if (outWim.isCompressedNtfs) RunSystemTool(L"compact.exe", L"/u \"" + outWim.fullPath + L"\"");
+        outWim = ResolvePeFile(g_cfg.wimInput);
+        outSdi = ResolvePeFile(g_cfg.sdiInput);
+    }
+
+    // 4. Deep WIM binary header & XML manifest validation
+    net_sync::WimInspectionInfo wi = net_sync::InspectWimFile(outWim.fullPath);
+    if (wi.fileOpened && !wi.validWimMagic) {
+        MessageBoxW(g_hMainWnd,
+                    (L"선택한 WIM 파일이 올바른 Microsoft WIM 이미지 포맷(MSWIM)이 아니거나 손상되었습니다:\n" +
+                     outWim.fullPath + L"\n\n파일 복사 중 손상되었거나 다른 형식의 이미지일 수 있으므로 정상 boot.wim 파일로 교체해 주세요.").c_str(),
+                    L"손상되거나 잘못된 WIM 파일", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    if (wi.isSplitSwm) {
+        MessageBoxW(g_hMainWnd,
+                    L"분할된 WIM(.swm) 이미지는 RAMDisk 단일 부팅을 지원하지 않습니다.\n단일 boot.wim 파일로 병합한 뒤 다시 시도해 주세요.",
+                    L"분할 WIM 부팅 미지원", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    if (g_isUefi && wi.arch == 0) {
+        MessageBoxW(g_hMainWnd,
+                    L"현재 PC는 64비트 UEFI 모드이나 선택한 WIM 파일이 [32비트(x86) WinPE] 이미지입니다.\n\n"
+                    L"64비트 UEFI 부트 매니저는 32비트 이미지를 로드할 수 없어 \\windows\\system32\\winload.efi (0xc000000f) 오류가 발생합니다.\n"
+                    L"64비트(x64) WinPE boot.wim 파일을 사용해 주세요.",
+                    L"32비트(x86) WIM 아키텍처 불일치", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    if (wi.isLzmsEsd) {
+        int ans = MessageBoxW(
+            g_hMainWnd,
+            L"선택한 WIM 파일은 확장자만 .wim이고 내부는 고압축 [ESD (LZMS 솔리드 압축)] 포맷입니다!\n\n"
+            L"Windows 부트 매니저(RAMDisk)는 ESD 압축을 직접 읽지 못해 재부팅 시 반드시\n"
+            L"\\windows\\system32\\winload.efi (상태: 0xc000000f) 오류가 발생합니다.\n\n"
+            L"지금 DISM을 통해 RAMDisk 부팅 표준 WIM(LZX 압축 + Bootable)으로 자동 변환한 뒤 이어서 진행할까요?\n"
+            L"(약 30~90초 소요, 변환 중 원본은 안전하게 보호됩니다)",
+            L"ESD(LZMS) 압축 포맷 감지 — 자동 변환 안내",
+            MB_ICONWARNING | MB_YESNO);
+        if (ans == IDYES) {
+            uint32_t srcIdx = (wi.bootIndex > 0) ? wi.bootIndex
+                                                 : ((wi.imageCount > 0) ? wi.imageCount : 1u);
+            StartAsyncEsdConvert(outWim.fullPath, srcIdx, esdFollowUp);
+        }
+        return false;
+    }
+
+    uint32_t activeImgIdx = (wi.bootIndex > 0) ? wi.bootIndex
+                                               : ((wi.imageCount > 0) ? wi.imageCount : 1u);
+
+    if (wi.validWimMagic && wi.imageCount > 0 && wi.bootIndex == 0) {
+        AppendLog(L"WIM 헤더에 부팅 가능 플래그(BootIndex=0)가 누락되어 있어 자동 설정을 수행합니다...");
+        if (net_sync::EnsureWimBootableFlag(outWim.fullPath, activeImgIdx,
+                                            [](const std::wstring& m) { AppendLog(m); })) {
+            outWim = ResolvePeFile(g_cfg.wimInput);
+            UpdateFileStatusBanner();
+        }
+    }
+
+    if (!wi.systemRoot.empty() && _wcsicmp(wi.systemRoot.c_str(), g_cfg.systemRoot.c_str()) != 0) {
+        AppendLog(L"WIM 메타데이터에 맞춰 SystemRoot 자동 보정: " + g_cfg.systemRoot + L" -> " + wi.systemRoot);
+        g_cfg.systemRoot = wi.systemRoot;
+        SetWindowTextW(g_hEdtSysRoot, g_cfg.systemRoot.c_str());
+    }
+
+    std::wstring preferredLoader = net_sync::DetectPreferredLoaderPathInWim(
+        outWim.fullPath, activeImgIdx, g_isUefi, g_cfg.loaderPath);
+    if (!preferredLoader.empty() && _wcsicmp(preferredLoader.c_str(), g_cfg.loaderPath.c_str()) != 0) {
+        AppendLog(L"WIM 내부 실제 부트 로더 위치 감지 — 경로 자동 보정: " + g_cfg.loaderPath + L" -> " + preferredLoader);
+        g_cfg.loaderPath = preferredLoader;
+        SetWindowTextW(g_hCmbLoader, g_cfg.loaderPath.c_str());
+    }
+
+    if (outWim.sizeBytes > (3ULL * 1024ULL * 1024ULL * 1024ULL)) {
+        wchar_t warnBuf[512];
+        swprintf_s(warnBuf,
+                   L"선택한 WIM 파일 크기가 %.2f GB로 매우 큽니다.\n"
+                   L"Windows 설치 본체(install.wim)이거나 초고용량 이미지일 경우, UEFI RAMDisk 메모리 한계로 인해 부팅 시 0xc000000f 또는 0xc0000017 오류가 발생할 수 있습니다. (일반 WinPE용 boot.wim 권장)\n\n"
+                   L"그래도 계속 진행하시겠습니까?",
+                   static_cast<double>(outWim.sizeBytes) / (1024.0 * 1024.0 * 1024.0));
+        if (MessageBoxW(g_hMainWnd, warnBuf, L"대용량 WIM 이미지 경고",
+                        MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
+            return false;
+        }
     }
 
     return true;
 }
 
-bool RegisterOrUpdateBcdEntries(ResolvedFileInfo& wimInfo, ResolvedFileInfo& sdiInfo) {
-    if (!ValidateInputsAndFiles(wimInfo, sdiInfo)) return false;
+bool RegisterOrUpdateBcdEntries(ResolvedFileInfo& wimInfo,
+                                ResolvedFileInfo& sdiInfo,
+                                bool alreadyValidated = false) {
+    if (!alreadyValidated) {
+        if (!ValidateInputsAndFiles(wimInfo, sdiInfo, PostPatchFollowUp::ContinueApplyBcdOnly)) {
+            return false;
+        }
+    }
     SaveConfigToIni(false);
 
     AppendLog(L"--- BCD 부팅 구성 등록/갱신 시작 ---");
@@ -1285,40 +1751,80 @@ bool RegisterOrUpdateBcdEntries(ResolvedFileInfo& wimInfo, ResolvedFileInfo& sdi
     return true;
 }
 
+bool IsVolumeBitLockerProtected(const std::wstring& driveColon, int cachedState) {
+    if (driveColon.empty()) return false;
+    if (cachedState == 1 || cachedState == 3) return true;
+    if (cachedState == 0 || cachedState == 2 || cachedState == 5 || cachedState == 8) return false;
+    if (g_isAdmin) {
+        CmdResult r = RunSystemTool(L"manage-bde.exe", L"-status " + driveColon, false);
+        if (r.output.find(L"Protection On") != std::wstring::npos ||
+            r.output.find(L"보호 켜짐") != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool HandleBitLockerBeforeBoot(const ResolvedFileInfo& wimInfo, const ResolvedFileInfo& sdiInfo) {
     bool shouldSuspend = g_cfg.suspendBitLocker;
-    bool blActiveOnTarget = (wimInfo.bitLockerState == 1) || (sdiInfo.bitLockerState == 1);
+    bool wimBlActive   = IsVolumeBitLockerProtected(wimInfo.driveColon, wimInfo.bitLockerState);
+    bool sdiBlActive   = (_wcsicmp(sdiInfo.driveColon.c_str(), wimInfo.driveColon.c_str()) == 0)
+                         ? wimBlActive
+                         : IsVolumeBitLockerProtected(sdiInfo.driveColon, sdiInfo.bitLockerState);
+    bool blActiveOnTarget = wimBlActive || sdiBlActive;
 
     if (!shouldSuspend && blActiveOnTarget) {
-        std::wstring targetDrv = (wimInfo.bitLockerState == 1) ? wimInfo.driveColon : sdiInfo.driveColon;
+        std::wstring targetDrv = wimBlActive ? wimInfo.driveColon : sdiInfo.driveColon;
         std::wstring msg =
-            L"대상 드라이브(" + targetDrv + L")에 현재 BitLocker 보호가 켜져 있습니다.\n"
-            L"보호를 일시 중지하지 않으면 부팅 단계에서 PE 파일을 읽지 못할 수 있습니다.\n\n"
-            L"재부팅 " + std::to_wstring(g_cfg.bitLockerRebootCount) +
-            L"회 동안 BitLocker 보호를 자동으로 일시 중지하고 진행할까요?\n"
+            L"대상 드라이브(" + targetDrv + L")에 현재 BitLocker(또는 Windows 장치 암호화) 보호가 켜져 있습니다.\n"
+            L"보호를 일시 중지하지 않으면 UEFI 부트 매니저가 PE 파일을 읽지 못해 \\windows\\system32\\winload.efi (0xc000000f) 오류가 발생합니다.\n\n"
+            L"BitLocker 보호를 자동으로 일시 중지하고 안전하게 진행할까요?\n"
             L"([예]: 일시 중지 후 진행  /  [아니오]: 일시 중지 없이 진행  /  [취소]: 작업 중단)";
         int ans = MessageBoxW(g_hMainWnd, msg.c_str(), L"BitLocker 암호화 감지", MB_ICONWARNING | MB_YESNOCANCEL);
         if (ans == IDCANCEL) return false;
-        if (ans == IDYES) shouldSuspend = true;
+        if (ans == IDYES) {
+            shouldSuspend = true;
+            SendMessageW(g_hChkBitLocker, BM_SETCHECK, BST_CHECKED, 0);
+            g_cfg.suspendBitLocker = true;
+        }
     }
 
     if (shouldSuspend) {
+        std::wstring sysDrv = GetSystemDriveColon();
         std::vector<std::wstring> drives = { wimInfo.driveColon };
         if (_wcsicmp(sdiInfo.driveColon.c_str(), wimInfo.driveColon.c_str()) != 0) {
             drives.push_back(sdiInfo.driveColon);
         }
         for (const auto& drv : drives) {
             int st = QueryVolumeBitLockerState(drv);
-            if (st == 1) {
-                std::wstring args = L"-protectors -disable " + drv +
-                                    L" -RebootCount " + std::to_wstring(g_cfg.bitLockerRebootCount);
-                CmdResult r = RunSystemTool(L"manage-bde.exe", args);
+            if (IsVolumeBitLockerProtected(drv, st)) {
+                bool isOsVolume = (_wcsicmp(drv.c_str(), sysDrv.c_str()) == 0);
+                CmdResult r{};
+                if (isOsVolume && g_cfg.bitLockerRebootCount > 0) {
+                    std::wstring args = L"-protectors -disable " + drv +
+                                        L" -RebootCount " + std::to_wstring(g_cfg.bitLockerRebootCount);
+                    r = RunSystemTool(L"manage-bde.exe", args);
+                    if (r.exitCode != 0) {
+                        AppendLog(L"RebootCount 지정 일시 중지 실패 — 표준 일시 중지 명령으로 재시도합니다 (" + drv + L")...");
+                        r = RunSystemTool(L"manage-bde.exe", L"-protectors -disable " + drv);
+                    }
+                } else {
+                    if (!isOsVolume) {
+                        AppendLog(L"비OS 데이터 볼륨(" + drv + L") BitLocker 보호 일시 중지 실행 (-RebootCount 제외)...");
+                    }
+                    r = RunSystemTool(L"manage-bde.exe", L"-protectors -disable " + drv);
+                }
+
                 if (r.exitCode != 0) {
-                    int cont = MessageBoxW(g_hMainWnd,
-                                           (L"BitLocker 일시 중지 명령이 실패했습니다 (" + drv + L").\n계속 진행하시겠습니까?").c_str(),
-                                           L"BitLocker 경고", MB_ICONWARNING | MB_YESNO);
+                    int cont = MessageBoxW(
+                        g_hMainWnd,
+                        (L"BitLocker 일시 중지 명령이 실패했습니다 (" + drv +
+                         L").\n이 상태로 재부팅하면 0xc000000f 부팅 오류가 발생할 수 있습니다.\n그래도 계속 진행하시겠습니까?").c_str(),
+                        L"BitLocker 일시 중지 실패", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
                     if (cont != IDYES) return false;
                 }
+            } else if (st == 5) {
+                AppendLog(L"드라이브 " + drv + L"는 이미 BitLocker 보호가 일시 중지된 상태입니다.");
             } else {
                 AppendLog(L"드라이브 " + drv + L"는 활성 BitLocker 잠금 상태가 아니므로 일시 중지를 건너뜁니다.");
             }
@@ -1329,8 +1835,10 @@ bool HandleBitLockerBeforeBoot(const ResolvedFileInfo& wimInfo, const ResolvedFi
 }
 
 void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = false) {
+    PostPatchFollowUp followUp = rebootImmediately ? PostPatchFollowUp::ContinueBootNow
+                                                   : PostPatchFollowUp::ContinueQueueOnly;
     ResolvedFileInfo wimInfo{}, sdiInfo{};
-    if (!ValidateInputsAndFiles(wimInfo, sdiInfo)) return;
+    if (!ValidateInputsAndFiles(wimInfo, sdiInfo, followUp)) return;
 
     // Check unattended network auto-apply option & WIM patch state
     if (g_cfg.autoApplyNetwork && !skipUnpatchedPrompt && !IsWimCurrentlyPatched(wimInfo)) {
@@ -1345,38 +1853,59 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
             MB_ICONQUESTION | MB_YESNOCANCEL);
         if (ans == IDCANCEL) return;
         if (ans == IDYES) {
-            StartAsyncWimPatch(rebootImmediately ? PostPatchFollowUp::ContinueBootNow
-                                                 : PostPatchFollowUp::ContinueQueueOnly);
+            StartAsyncWimPatch(followUp);
             return;
         }
     }
 
-    if (g_cfg.autoApplyNetwork) {
-        ActionSyncWindowsNetworkNow(false);
+    net_sync::WimInspectionInfo wi = net_sync::InspectWimFile(wimInfo.fullPath);
+    bool warnOldPeSecureBoot = (g_isUefi && g_secureBootState == 1 && wi.osBuild > 0 && wi.osBuild < 22000);
+    if (warnOldPeSecureBoot) {
+        AppendLog(L"참고: UEFI Secure Boot가 켜져 있으며 선택한 WIM은 구형 빌드(Build " +
+                  std::to_wstring(wi.osBuild) +
+                  L")입니다. 최신 보안 패치(KB5025885 등)가 적용된 노트북에서 차단될 경우 BIOS에서 Secure Boot를 잠시 끄거나 Win11 기반 PE를 사용하세요.");
     }
 
-    if (!RegisterOrUpdateBcdEntries(wimInfo, sdiInfo)) return;
-    if (!HandleBitLockerBeforeBoot(wimInfo, sdiInfo)) return;
-
     if (rebootImmediately) {
-        wchar_t confirmMsg[640];
+        std::wstring sbNote;
+        if (warnOldPeSecureBoot) {
+            sbNote = L"\n⚠ 참고: 현재 Secure Boot가 켜져 있고 구형 PE(Build " + std::to_wstring(wi.osBuild) +
+                     L")가 선택되어 있습니다. 부팅이 차단될 경우 Win11 PE를 쓰거나 BIOS에서 Secure Boot를 꺼주세요.\n";
+        }
+        wchar_t confirmMsg[1024];
         swprintf_s(confirmMsg,
                    L"설정을 저장하고 다음 1회 재부팅을 WinPE로 예약한 뒤 %d초 후 재부팅합니다.\n\n"
                    L"• WIM: %s\n"
                    L"• 로더: %s\n"
-                   L"• 네트워크 무인 적용: %s\n\n"
+                   L"• 네트워크 무인 적용: %s\n%s\n"
                    L"PE에서 작업 완료 후 재부팅하면 자동으로 기존 Windows로 복귀합니다.\n"
                    L"지금 재부팅하시겠습니까?",
                    g_cfg.rebootDelaySec,
                    wimInfo.fullPath.c_str(),
                    g_cfg.loaderPath.c_str(),
-                   g_cfg.autoApplyNetwork ? L"활성화됨 (드라이버 및 IP/DNS/Wi-Fi 동기화)" : L"비활성");
+                   g_cfg.autoApplyNetwork ? L"활성화됨 (드라이버 및 IP/DNS/Wi-Fi 동기화)" : L"비활성",
+                   sbNote.c_str());
         if (MessageBoxW(g_hMainWnd, confirmMsg, L"1회성 WinPE 부팅 실행 확인",
                         MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
             AppendLog(L"사용자가 재부팅을 취소했습니다.");
             return;
         }
     }
+
+    if (g_cfg.autoApplyNetwork) {
+        std::wstring wimParentDir;
+        size_t sl = wimInfo.fullPath.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) {
+            wimParentDir = wimInfo.fullPath.substr(0, sl);
+        }
+        bool useCacheExport = !wimParentDir.empty() &&
+                              (ToLower(wimParentDir).find(L"onetimepe_cache") != std::wstring::npos);
+        ActionSyncWindowsNetworkNow(false, useCacheExport ? wimParentDir : L"");
+    }
+
+    // Suspend BitLocker BEFORE modifying BCD so protectors/PCR state and Clear Key are cleanly prepared
+    if (!HandleBitLockerBeforeBoot(wimInfo, sdiInfo)) return;
+    if (!RegisterOrUpdateBcdEntries(wimInfo, sdiInfo, true)) return;
 
     CmdResult seqRes = RunSystemTool(L"bcdedit.exe", L"/bootsequence \"" + g_cfg.peGuid + L"\"");
     if (seqRes.exitCode != 0) {
@@ -1411,7 +1940,7 @@ void ActionCancelOrCleanBcd() {
     int choice = MessageBoxW(
         g_hMainWnd,
         L"수행할 작업을 선택하세요:\n\n"
-        L"• [예(Y)] : 1회성 부팅 예약 취소 + 등록된 PE/SDI BCD 항목까지 모두 깨끗하게 삭제\n"
+        L"• [예(Y)] : 1회성 부팅 예약 취소 + 등록된 PE/SDI BCD 항목 및 임시 캐시 정리\n"
         L"• [아니오(N)] : BCD 항목은 남겨두고 '1회성 부팅 예약(bootsequence)'만 취소\n"
         L"• [취소] : 닫기",
         L"예약 취소 및 BCD 정리", MB_ICONQUESTION | MB_YESNOCANCEL);
@@ -1429,6 +1958,20 @@ void ActionCancelOrCleanBcd() {
         }
         g_cfg.peGuid.clear();
         g_cfg.sdiGuid.clear();
+
+        std::wstring cacheDir = GetSystemDriveColon() + L"\\OneTimePE_Cache";
+        if (_wcsicmp(g_appDir.c_str(), cacheDir.c_str()) != 0 &&
+            GetFileAttributesW(cacheDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            RemoveDirectoryTree(cacheDir);
+            if (ToLower(GetWndText(g_hCmbWim)).find(L"onetimepe_cache") != std::wstring::npos ||
+                ToLower(GetWndText(g_hCmbSdi)).find(L"onetimepe_cache") != std::wstring::npos) {
+                SetWindowTextW(g_hCmbWim, L"boot.wim");
+                SetWindowTextW(g_hCmbSdi, L"boot.sdi");
+                ScanLocalPeFiles(true);
+            }
+            AppendLog(L"내장 임시 캐시 폴더 정리 완료: " + cacheDir);
+        }
+
         SaveConfigToIni(false);
         AppendLog(L"1회성 예약 취소 및 BCD 등록 항목 완전 삭제가 완료되었습니다.");
     } else {
@@ -1679,6 +2222,9 @@ void PopulateInitialValues() {
 
     AppendLog(L"OneTimePE 실행 완료. 앱 폴더: " + g_appDir);
     AppendLog(L"시스템 보안 상태 — " + sysInfo);
+    if (g_resetFromOtherPc) {
+        AppendLog(L"알림: 다른 PC에서 복사된 설정(OneTimePE.ini)이 감지되어 이전 BCD GUID를 초기화하고 현재 PC 펌웨어에 맞게 로더 경로를 보정했습니다.");
+    }
     AppendLog(L"최초 1회 [WIM 무인패치 적용]을 수행하면, PE 부팅 직후 자동으로 현재 네트워크와 랜카드 드라이버가 적용됩니다.");
 }
 
@@ -1852,18 +2398,13 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_APP_TASK_DONE: {
-            struct PatchDonePayload {
-                bool success;
-                std::wstring wimPath;
-                std::wstring newSig;
-                PostPatchFollowUp followUp;
-            };
-            auto* payload = reinterpret_cast<PatchDonePayload*>(lParam);
+            auto* payload = reinterpret_cast<AsyncWimTaskResult*>(lParam);
             SetTaskBusyState(false);
             if (payload) {
-                bool ok = payload->success;
+                AsyncWimTaskKind kind = payload->kind;
+                bool ok               = payload->success;
                 PostPatchFollowUp next = payload->followUp;
-                if (ok) {
+                if (ok && kind == AsyncWimTaskKind::UnattendedNetPatch) {
                     g_cfg.patchedWimPath = payload->wimPath;
                     g_cfg.patchedWimSig  = payload->newSig;
                     SaveConfigToIni(false);
@@ -1872,20 +2413,41 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 delete payload;
 
                 if (ok) {
-                    if (next == PostPatchFollowUp::ContinueBootNow) {
-                        ActionQueueOneTimeBoot(true, true);
-                    } else if (next == PostPatchFollowUp::ContinueQueueOnly) {
-                        ActionQueueOneTimeBoot(false, true);
+                    if (kind == AsyncWimTaskKind::ConvertEsdToWim) {
+                        if (next == PostPatchFollowUp::ContinueBootNow) {
+                            ActionQueueOneTimeBoot(true, false);
+                        } else if (next == PostPatchFollowUp::ContinueQueueOnly) {
+                            ActionQueueOneTimeBoot(false, false);
+                        } else if (next == PostPatchFollowUp::ContinueApplyBcdOnly) {
+                            ResolvedFileInfo w{}, s{};
+                            if (RegisterOrUpdateBcdEntries(w, s)) {
+                                MessageBoxW(hWnd,
+                                            (L"ESD → 표준 WIM 변환 및 시스템 BCD 등록이 완료되었습니다.\n\nPE GUID: " + g_cfg.peGuid).c_str(),
+                                            L"변환 및 BCD 등록 완료", MB_ICONINFORMATION | MB_OK);
+                            }
+                        } else {
+                            MessageBoxW(hWnd,
+                                        L"ESD(LZMS) 이미지를 RAMDisk 부팅 표준 WIM 포맷으로 변환 완료했습니다!",
+                                        L"WIM 포맷 변환 완료", MB_ICONINFORMATION | MB_OK);
+                        }
                     } else {
-                        MessageBoxW(hWnd,
-                                    L"선택한 WIM 파일에 무인 네트워크 자동 실행 패치가 성공적으로 완료되었습니다!\n\n"
-                                    L"이제 PE로 부팅하면 자동으로 랜카드 드라이버 적재 및 IP/DNS/Wi-Fi 설정이 적용됩니다.",
-                                    L"WIM 무인 패치 완료", MB_ICONINFORMATION | MB_OK);
+                        if (next == PostPatchFollowUp::ContinueBootNow) {
+                            ActionQueueOneTimeBoot(true, true);
+                        } else if (next == PostPatchFollowUp::ContinueQueueOnly) {
+                            ActionQueueOneTimeBoot(false, true);
+                        } else {
+                            MessageBoxW(hWnd,
+                                        L"선택한 WIM 파일에 무인 네트워크 자동 실행 패치 및 부트 로더 보정이 완료되었습니다!\n\n"
+                                        L"이제 PE로 부팅하면 자동으로 랜카드 드라이버 적재 및 IP/DNS/Wi-Fi 설정이 적용됩니다.",
+                                        L"WIM 무인 패치 완료", MB_ICONINFORMATION | MB_OK);
+                        }
                     }
                 } else {
                     MessageBoxW(hWnd,
-                                L"WIM 무인 패치 작업 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요.",
-                                L"WIM 패치 실패", MB_ICONERROR | MB_OK);
+                                (kind == AsyncWimTaskKind::ConvertEsdToWim)
+                                    ? L"ESD → 표준 WIM 변환 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요."
+                                    : L"WIM 무인 패치 작업 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요.",
+                                L"WIM 작업 실패", MB_ICONERROR | MB_OK);
                 }
             }
             return 0;
@@ -1951,7 +2513,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 }
             } else if (hCtrl == g_hLblFileStatus) {
                 std::wstring st = GetWndText(g_hLblFileStatus);
-                if (st.find(L"파일 없음") != std::wstring::npos || st.find(L"이동식") != std::wstring::npos) {
+                if (st.find(L"파일 없음") != std::wstring::npos ||
+                    st.find(L"이동식") != std::wstring::npos ||
+                    st.find(L"⚠") != std::wstring::npos) {
                     SetTextColor(hdc, RGB(185, 40, 30));
                 } else {
                     SetTextColor(hdc, RGB(20, 105, 55));
@@ -2105,6 +2669,7 @@ void InitAppDirOnly() {
 void InitPathsAndEnv() {
     InitAppDirOnly();
     g_iniPath         = JoinPath(g_appDir, L"OneTimePE.ini");
+    g_machineId       = GetLocalMachineId();
     g_isUefi          = DetectFirmwareIsUefi();
     g_secureBootState = DetectSecureBootState();
     g_isAdmin         = DetectIsAdmin();
