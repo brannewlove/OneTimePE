@@ -26,6 +26,18 @@ git clone https://github.com/brannewlove/OneTimePE.git
 cd OneTimePE
 ```
 
+#### 이미 복제한(Clone) 다른 환경에서 최신 수정본 받아 다시 빌드하기 (중요!)
+
+저장소에 포함된 `PEBoot\OneTimePE.exe`나 이전 빌드 산출물이 타겟 PC에서 수정된 상태이면 일반 `git pull` 실행 시 충돌로 인해 소스 코드(`src\*`)가 갱신되지 않고 **예전 소스가 그대로 다시 빌드**될 수 있습니다.
+
+다른 환경에서 최신 수정을 받아 빌드할 때는 반드시 아래 원클릭 동기화 빌드 명령을 사용하세요:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Sync
+```
+
+(또는 수동으로 `git fetch origin; git reset --hard origin/main` 실행 후 `.\build.ps1` 실행)
+
 > **참고**: 저장소에 이전 테스트 환경의 산출물(`build/`, `PEBoot/NetConfig/`)이 포함되어 있을 경우, 새 환경에서 빌드하기 전 아래 명령으로 정리하는 것을 권장합니다.
 > ```powershell
 > Remove-Item -Recurse -Force .\build, .\PEBoot\NetConfig, .\PEBoot\OneTimePE.ini -ErrorAction SilentlyContinue
@@ -138,10 +150,7 @@ cmake --build build-cmake
 ```
 
 * Ninja가 설치된 경우 `-G "Ninja"`를 사용할 수 있습니다.
-* CMake 빌드 산출물은 `build-cmake\OneTimePE.exe`에 생성되므로 실행 배포 폴더(`PEBoot\`)로 복사하여 사용합니다.
-  ```powershell
-  Copy-Item .\build-cmake\OneTimePE.exe .\PEBoot\OneTimePE.exe -Force
-  ```
+* `CMakeLists.txt`에 출력 경로가 `PEBoot\`로 지정되어 있으므로 빌드 완료 즉시 **`PEBoot\OneTimePE.exe`** 가 자동 갱신됩니다.
 
 ---
 
@@ -151,14 +160,17 @@ cmake --build build-cmake
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\build, .\PEBoot | Out-Null
+Remove-Item -Force .\PEBoot\OneTimePE.exe -ErrorAction SilentlyContinue
+Set-Content -Path .\build\no_default_manifest.spec -Encoding ASCII -Value "*endfile:`ncrtend.o%s`n"
 
 windres -I .\src -c 65001 .\src\app.rc -O coff -o .\build\app.res
 
 g++ -std=c++20 -O2 -Wall -Wextra `
     -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00 `
-    -I.\src .\src\main.cpp .\src\net_sync.cpp .\build\app.res `
+    -I.\src -specs=build\no_default_manifest.spec `
+    .\src\main.cpp .\src\net_sync.cpp .\build\app.res `
     -municode -mwindows -static -s -Wl,--gc-sections `
-    -lcomctl32 -lole32 -lshell32 -luuid -lgdi32 -luser32 -liphlpapi `
+    -lcomctl32 -lole32 -lshell32 -luuid -lgdi32 -luser32 -liphlpapi -lws2_32 `
     -o .\PEBoot\OneTimePE.exe
 ```
 

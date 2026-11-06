@@ -52,10 +52,14 @@ OneTimePE/
 | **WIM 무인 자동 실행 패치** | DISM으로 `boot.wim`을 마운트하여 표준 PE(`startnet.cmd`)와 커스텀 PECMD/GUI PE(`winpeshl.ini`, `Startup`) 모두에서 `OneTimePE.exe --pe-apply-net`이 1회 자동 실행되도록 패치 |
 | **추가 변수** | 세미콜론(`;`)으로 구분하여 추가 `bcdedit /set {GUID} <변수>` 명령 지정 가능 |
 
-## 직접 다시 빌드하기
+## 직접 다시 빌드하기 (`clang++` / `g++` / Visual Studio `cl.exe` 모두 지원)
 
-LLVM-MinGW(`clang++`, `windres`)가 설치된 환경에서 아래 명령을 실행하면 `PEBoot\OneTimePE.exe`가 생성됩니다.
+LLVM-MinGW(`clang++`), 일반 MinGW-w64(`g++`), 또는 Visual Studio(`cl.exe`)가 설치된 환경에서 아래 명령을 실행하면 `PEBoot\OneTimePE.exe`가 생성됩니다.
 
 ```powershell
+# 로컬 소스 빌드
 powershell -ExecutionPolicy Bypass -File .\build.ps1
+
+# 다른 PC(Git 복제 환경)에서 최신 원격 커밋 강제 동기화 후 빌드
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Sync
 ```

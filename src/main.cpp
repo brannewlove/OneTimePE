@@ -26,10 +26,15 @@
 #include "resource.h"
 #include "net_sync.h"
 
+#define OTPE_WIDE_IMPL(x) L##x
+#define OTPE_WIDE(x)      OTPE_WIDE_IMPL(x)
+
 namespace {
 
+constexpr wchar_t kAppVersion[]      = L"v1.2";
+constexpr wchar_t kBuildTimestamp[]  = OTPE_WIDE(__DATE__) L" " OTPE_WIDE(__TIME__);
 constexpr wchar_t kWindowClassName[] = L"OneTimePE_MainWindow";
-constexpr wchar_t kWindowTitle[]     = L"OneTimePE - 1회성 내장 WinPE 부팅 & 무인 네트워크 매니저";
+constexpr wchar_t kWindowTitle[]     = L"OneTimePE v1.2 (커스텀PE 지원) - 1회성 내장 WinPE & 무인 네트워크 매니저";
 constexpr wchar_t kIniSection[]      = L"OneTimePE";
 
 struct AppConfig {
@@ -2981,12 +2986,17 @@ void PopulateInitialValues() {
     ScanLocalPeFiles(false);
     RefreshBcdStatusUI();
 
-    AppendLog(L"OneTimePE 실행 완료. 앱 폴더: " + g_appDir);
+    wchar_t exeBuf[MAX_PATH * 4]{};
+    DWORD exeLen = GetModuleFileNameW(nullptr, exeBuf, _countof(exeBuf));
+    std::wstring selfPath(exeBuf, exeLen);
+
+    AppendLog(std::wstring(L"OneTimePE ") + kAppVersion + L" [빌드 시각: " + kBuildTimestamp + L"] 실행 완료.");
+    AppendLog(L"실행 파일 경로: " + selfPath);
     AppendLog(L"시스템 보안 상태 — " + sysInfo);
     if (g_resetFromOtherPc) {
         AppendLog(L"알림: 다른 PC에서 복사된 설정(OneTimePE.ini)이 감지되어 이전 BCD GUID를 초기화하고 현재 PC 펌웨어에 맞게 로더 경로를 보정했습니다.");
     }
-    AppendLog(L"최초 1회 [WIM 무인패치 적용]을 수행하면, PE 부팅 직후 자동으로 현재 네트워크와 랜카드 드라이버가 적용됩니다.");
+    AppendLog(L"커스텀 PE 사용 시 상단 [★ 커스텀PE 가져오기] 버튼을 누르거나 .iso / 폴더를 드래그 앤 드롭하세요.");
 }
 
 void CreateAllControls(HWND hWnd) {
@@ -3015,7 +3025,7 @@ void CreateAllControls(HWND hWnd) {
                                0, 0, 10, 10, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
     };
 
-    g_hLblTitle   = mkStatic(L"OneTimePE - 1회성 내장 WinPE & 무인 네트워크 매니저", SS_LEFT, IDC_LBL_TITLE);
+    g_hLblTitle   = mkStatic(L"OneTimePE v1.2 - 1회성 내장 WinPE & 커스텀PE 매니저", SS_LEFT, IDC_LBL_TITLE);
     g_hLblSysInfo = mkStatic(L"", SS_RIGHT, IDC_LBL_SYSINFO);
 
     // Group 1

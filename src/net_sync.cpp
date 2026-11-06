@@ -1106,7 +1106,7 @@ std::wstring ResolvePhysicalCdromToDriveRoot(const std::wstring& physPath, DWORD
     bool hasPhysNt = !dosDevName.empty() &&
                      (QueryDosDeviceW(dosDevName.c_str(), physNtTarget, _countof(physNtTarget)) > 0);
     if (!hasPhysNt && physPath.rfind(L"\\Device\\", 0) == 0) {
-        wcsncpy_s(physNtTarget, physPath.c_str(), _TRUNCATE);
+        wcsncpy_s(physNtTarget, _countof(physNtTarget), physPath.c_str(), _countof(physNtTarget) - 1);
         hasPhysNt = true;
     }
 
