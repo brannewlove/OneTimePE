@@ -16,6 +16,16 @@ if ((Test-Path (Join-Path $root ".git")) -and (Get-Command git -ErrorAction Sile
         if ($LASTEXITCODE -ne 0) { throw "git fetch origin failed." }
         & git -C $root reset --hard origin/main
         if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/main failed." }
+    } else {
+        # Check if local repo is dirty due to locally rebuilt PEBoot/OneTimePE.exe
+        $dirtyFiles = (& git -C $root status --porcelain 2>$null)
+        if ($dirtyFiles) {
+            $hasDirtyExe = $dirtyFiles | Where-Object { $_ -match "PEBoot/OneTimePE\.exe" }
+            if ($hasDirtyExe) {
+                Write-Host "[Git 주의] 다른 환경에서 이전 빌드로 생성된 PEBoot/OneTimePE.exe 로 인해 일반 'git pull' 시 충돌(overwrite 거부)이 발생할 수 있습니다." -ForegroundColor Yellow
+                Write-Host "         최신 GitHub 코드를 강제 동기화하여 빌드하려면 '.\build.ps1 -Sync' 를 실행하세요." -ForegroundColor Yellow
+            }
+        }
     }
     $headInfo = (& git -C $root log -n 1 --format="%h (%ci) %s" 2>$null)
     if ($headInfo) {
