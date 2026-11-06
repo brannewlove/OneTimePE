@@ -48,6 +48,47 @@ struct WimInspectionInfo {
     std::wstring imageName;
 };
 
+struct CustomPeBootEntry {
+    std::wstring      bcdGuid;
+    std::wstring      description;
+    std::wstring      wimRelPath;       // e.g. "\\sources\\boot.wim" or "\\SSTR\\strelec10x64Eng.wim"
+    std::wstring      wimFullPath;      // resolved full path on media
+    std::wstring      sdiRelPath;       // e.g. "\\boot\\boot.sdi"
+    std::wstring      sdiFullPath;      // resolved full path on media
+    std::wstring      loaderPath;       // e.g. "\\windows\\system32\\boot\\winload.efi"
+    std::wstring      systemRoot;       // e.g. "\\windows"
+    bool              hasWinpeFlag     = false;
+    bool              winpeMode        = true;
+    bool              hasDetectHalFlag = false;
+    bool              detectHal        = true;
+    std::wstring      nxPolicy;         // "", "OptIn", "OptOut", "AlwaysOff", "AlwaysOn"
+    std::wstring      extraSetArgs;     // e.g. "nointegritychecks yes; testsigning yes"
+    bool              hasNoIntegrity   = false;
+    bool              hasTestSigning   = false;
+    bool              isDefault        = false;
+    int               displayOrderRank = 9999;
+    WimInspectionInfo wimInfo;
+};
+
+struct CustomPeDiscoveryResult {
+    bool                           ok = false;
+    std::wstring                   errorMsg;
+    std::wstring                   mediaRoot;
+    std::wstring                   usedBcdPath;
+    bool                           synthesizedWithoutBcd = false;
+    std::vector<CustomPeBootEntry> entries;
+    std::vector<std::wstring>      externalToolMarkers;
+};
+
+struct IsoMountSession {
+    bool         mounted        = false;
+    bool         mountedByUs    = false;
+    bool         usedPowerShell = false;
+    std::wstring isoFullPath;
+    std::wstring driveRoot;     // e.g. "E:\\"
+    HANDLE       vhdHandle      = INVALID_HANDLE_VALUE;
+};
+
 // Fast (non-blocking) detection of active Windows network adapters, drivers, and Wi-Fi
 DetectedNetworkSummary DetectActiveWindowsNetwork();
 
@@ -73,6 +114,20 @@ std::wstring DetectPreferredLoaderPathInWim(const std::wstring& wimFullPath,
                                             uint32_t imageIndex,
                                             bool isUefi,
                                             const std::wstring& currentLoaderPath);
+
+// Mount an ISO image read-only (dynamically via virtdisk.dll with PowerShell fallback)
+bool MountIsoReadOnly(const std::wstring& isoFullPath,
+                      IsoMountSession& outSession,
+                      const LogCallback& logCb);
+
+// Unmount an ISO session if it was mounted by OneTimePE
+void UnmountIsoSession(IsoMountSession& session,
+                       const LogCallback& logCb);
+
+// Parse EFI\Microsoft\Boot\BCD (or boot\bcd / folder scan) and discover Custom PE WIM + SDI + flags
+CustomPeDiscoveryResult AnalyzeCustomPeMedia(const std::wstring& selectedPath,
+                                             bool preferUefi,
+                                             const LogCallback& logCb);
 
 // Export current Windows network settings, Wi-Fi XML, NIC drivers, and bridge pointer
 bool ExportNetworkConfigForPe(const std::wstring& appDir,

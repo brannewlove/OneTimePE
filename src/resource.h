@@ -16,6 +16,7 @@
 #define IDC_BTN_BROWSE_SDI      1007
 #define IDC_BTN_GEN_SDI         1008
 #define IDC_LBL_FILESTATUS      1009
+#define IDC_BTN_IMPORT_CUSTOM   1010
 
 // Group 2: Boot Variables & Security
 #define IDC_EDT_DESC            1101
@@ -54,3 +55,10 @@
 // Header Labels
 #define IDC_LBL_TITLE           1401
 #define IDC_LBL_SYSINFO         1402
+
+// Custom PE Import Dialog Controls
+#define IDC_DLG_BTN_PICK_ISO    1501
+#define IDC_DLG_BTN_PICK_DIR    1502
+#define IDC_DLG_PE_LIST         1503
+#define IDC_DLG_BTN_OK          1504
+#define IDC_DLG_BTN_CANCEL      1505

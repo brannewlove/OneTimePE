@@ -7,9 +7,14 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <winioctl.h>
+#include <virtdisk.h>
 #include <iphlpapi.h>
 #include <wlanapi.h>
 
@@ -1024,6 +1029,1195 @@ std::wstring DetectPreferredLoaderPathInWim(const std::wstring& wimFullPath,
 
     FreeLibrary(hWimDll);
     return detected;
+}
+
+namespace {
+
+bool EndsWithLower(const std::wstring& str, const std::wstring& suffixLower) {
+    std::wstring low = ToLower(str);
+    return low.size() >= suffixLower.size() &&
+           low.compare(low.size() - suffixLower.size(), suffixLower.size(), suffixLower) == 0;
+}
+
+std::wstring ParentDirOf(const std::wstring& path) {
+    std::wstring p = path;
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    size_t sl = p.find_last_of(L"\\/");
+    if (sl == std::wstring::npos) return L"";
+    if (sl == 2 && p.size() >= 2 && p[1] == L':') return p.substr(0, 3);
+    return p.substr(0, sl);
+}
+
+std::wstring FileNameOf(const std::wstring& path) {
+    std::wstring p = path;
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    size_t sl = p.find_last_of(L"\\/");
+    return (sl == std::wstring::npos) ? p : p.substr(sl + 1);
+}
+
+std::wstring StemOf(const std::wstring& fileName) {
+    size_t dot = fileName.find_last_of(L'.');
+    return (dot == std::wstring::npos || dot == 0) ? fileName : fileName.substr(0, dot);
+}
+
+bool FileExistsRegular(const std::wstring& path) {
+    if (path.empty()) return false;
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0);
+}
+
+bool DirExists(const std::wstring& path) {
+    if (path.empty()) return false;
+    DWORD attr = GetFileAttributesW(path.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES) && ((attr & FILE_ATTRIBUTE_DIRECTORY) != 0);
+}
+
+std::wstring EscapePsSingleQuoted(const std::wstring& s) {
+    std::wstring out;
+    out.reserve(s.size() + 4);
+    for (wchar_t c : s) {
+        if (c == L'\'') out += L"''";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+bool QueryDeviceNumberForHandlePath(const std::wstring& devPath, STORAGE_DEVICE_NUMBER& outSdn) {
+    HANDLE h = CreateFileW(devPath.c_str(), 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD ret = 0;
+    BOOL ok = DeviceIoControl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+                              &outSdn, sizeof(outSdn), &ret, nullptr);
+    CloseHandle(h);
+    return ok != FALSE && ret >= sizeof(STORAGE_DEVICE_NUMBER);
+}
+
+std::wstring ResolvePhysicalCdromToDriveRoot(const std::wstring& physPath, DWORD newDrivesMask) {
+    DWORD curDrives = GetLogicalDrives();
+
+    // 1. Match via QueryDosDeviceW NT symlink target (e.g. "CDROM0" -> "\Device\CdRom0" == "E:")
+    std::wstring dosDevName = physPath;
+    if (dosDevName.rfind(L"\\\\.\\", 0) == 0) {
+        dosDevName = dosDevName.substr(4);
+    }
+    wchar_t physNtTarget[MAX_PATH * 2]{};
+    bool hasPhysNt = !dosDevName.empty() &&
+                     (QueryDosDeviceW(dosDevName.c_str(), physNtTarget, _countof(physNtTarget)) > 0);
+    if (!hasPhysNt && physPath.rfind(L"\\Device\\", 0) == 0) {
+        wcsncpy_s(physNtTarget, physPath.c_str(), _TRUNCATE);
+        hasPhysNt = true;
+    }
+
+    STORAGE_DEVICE_NUMBER sdnPhys{};
+    bool hasPhysSdn = !physPath.empty() && QueryDeviceNumberForHandlePath(physPath, sdnPhys);
+
+    for (int bit = 0; bit < 26; ++bit) {
+        if ((curDrives & (1u << bit)) == 0) continue;
+        wchar_t drvColon[4] = { static_cast<wchar_t>(L'A' + bit), L':', L'\0', L'\0' };
+        wchar_t drvRoot[4]  = { static_cast<wchar_t>(L'A' + bit), L':', L'\\', L'\0' };
+
+        if (hasPhysNt) {
+            wchar_t drvNtTarget[MAX_PATH * 2]{};
+            if (QueryDosDeviceW(drvColon, drvNtTarget, _countof(drvNtTarget)) > 0 &&
+                _wcsicmp(drvNtTarget, physNtTarget) == 0) {
+                return drvRoot;
+            }
+        }
+        if (hasPhysSdn) {
+            STORAGE_DEVICE_NUMBER sdnDrv{};
+            if (QueryDeviceNumberForHandlePath(std::wstring(L"\\\\.\\") + drvColon, sdnDrv) &&
+                sdnDrv.DeviceType == sdnPhys.DeviceType &&
+                sdnDrv.DeviceNumber == sdnPhys.DeviceNumber) {
+                return drvRoot;
+            }
+        }
+    }
+
+    // 2. Fallback: newly appeared CD-ROM drive bit
+    if (newDrivesMask != 0) {
+        for (int bit = 0; bit < 26; ++bit) {
+            if ((newDrivesMask & (1u << bit)) != 0) {
+                wchar_t drvRoot[4] = { static_cast<wchar_t>(L'A' + bit), L':', L'\\', L'\0' };
+                if (GetDriveTypeW(drvRoot) == DRIVE_CDROM) {
+                    return drvRoot;
+                }
+            }
+        }
+    }
+
+    return L"";
+}
+
+std::wstring FormatBcdGuidBytes(const uint8_t* b) {
+    GUID g{};
+    std::memcpy(&g, b, 16);
+    wchar_t buf[64]{};
+    swprintf_s(buf, L"{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+               g.Data1, g.Data2, g.Data3,
+               g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+               g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7]);
+    return ToLower(buf);
+}
+
+struct BcdElementVal {
+    uint32_t             dataType = 0;
+    std::vector<uint8_t> raw;
+
+    std::wstring asSz() const {
+        if ((dataType == REG_SZ || dataType == REG_EXPAND_SZ) && raw.size() >= 2) {
+            std::wstring s(reinterpret_cast<const wchar_t*>(raw.data()), raw.size() / 2);
+            while (!s.empty() && s.back() == L'\0') s.pop_back();
+            return Trim(s);
+        }
+        return L"";
+    }
+
+    std::vector<std::wstring> asMultiSz() const {
+        std::vector<std::wstring> out;
+        if (dataType == REG_MULTI_SZ && raw.size() >= 2) {
+            const auto* p = reinterpret_cast<const wchar_t*>(raw.data());
+            size_t n = raw.size() / 2;
+            std::wstring cur;
+            for (size_t i = 0; i < n; ++i) {
+                if (p[i] == L'\0') {
+                    if (!cur.empty()) {
+                        out.push_back(Trim(cur));
+                        cur.clear();
+                    }
+                } else {
+                    cur.push_back(p[i]);
+                }
+            }
+            if (!cur.empty()) out.push_back(Trim(cur));
+        }
+        return out;
+    }
+
+    bool asBool(bool defVal = false) const {
+        if (raw.empty()) return defVal;
+        return raw[0] != 0;
+    }
+
+    uint64_t asUint64(uint64_t defVal = UINT64_MAX) const {
+        if (raw.size() >= 8) {
+            uint64_t v = 0;
+            std::memcpy(&v, raw.data(), 8);
+            return v;
+        }
+        if (raw.size() >= 4) {
+            uint32_t v = 0;
+            std::memcpy(&v, raw.data(), 4);
+            return v;
+        }
+        return defVal;
+    }
+};
+
+struct BcdObjectNode {
+    std::wstring                          guid;
+    uint32_t                              objType = 0;
+    std::map<std::wstring, BcdElementVal> elements; // lowercase 8-hex -> value
+};
+
+// Parse BCD binary device element (11000001 / 21000001) for BM_DEV_RAMDISK (.wim / .esd) + SDI device GUID
+bool ParseRamdiskDeviceBlob(const std::vector<uint8_t>& raw,
+                            std::wstring& outSdiGuid,
+                            std::wstring& outWimRelPath) {
+    outSdiGuid.clear();
+    outWimRelPath.clear();
+    if (raw.size() < 40) return false;
+
+    GUID g{};
+    std::memcpy(&g, raw.data(), 16);
+    if (g.Data1 != 0 || g.Data2 != 0 || g.Data3 != 0) {
+        outSdiGuid = FormatBcdGuidBytes(raw.data());
+    }
+
+    if (raw.size() >= 0x54) {
+        uint32_t outerType = 0;
+        std::memcpy(&outerType, raw.data() + 0x20, 4);
+        uint32_t innerSize = 0;
+        std::memcpy(&innerSize, raw.data() + 0x4C, 4);
+        size_t strOff = 0x44u + static_cast<size_t>(innerSize);
+        if (outerType == 3 && innerSize >= 0x10 && strOff + 4 <= raw.size()) {
+            const auto* wp = reinterpret_cast<const wchar_t*>(raw.data() + strOff);
+            size_t maxChars = (raw.size() - strOff) / 2;
+            size_t len = 0;
+            while (len < maxChars && wp[len] != L'\0') ++len;
+            if (len > 0) {
+                outWimRelPath.assign(wp, len);
+                for (auto& ch : outWimRelPath) {
+                    if (ch == L'/') ch = L'\\';
+                }
+                if (outWimRelPath.front() != L'\\') outWimRelPath = L"\\" + outWimRelPath;
+                return true;
+            }
+        }
+    }
+
+    // Safe UTF-16LE fallback scan for "\*.wim" or "\*.esd"
+    for (size_t off = 32; off + 10 <= raw.size(); off += 2) {
+        wchar_t ch = 0;
+        std::memcpy(&ch, raw.data() + off, 2);
+        if (ch == L'\\' || ch == L'/') {
+            std::wstring cand;
+            for (size_t j = off; j + 1 < raw.size(); j += 2) {
+                wchar_t c2 = 0;
+                std::memcpy(&c2, raw.data() + j, 2);
+                if (c2 == L'\0') break;
+                if (c2 < 32 || c2 == L'*' || c2 == L'?' || c2 == L'|') {
+                    cand.clear();
+                    break;
+                }
+                cand.push_back(c2 == L'/' ? L'\\' : c2);
+            }
+            if (cand.size() >= 5 && (EndsWithLower(cand, L".wim") || EndsWithLower(cand, L".esd"))) {
+                outWimRelPath = cand;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Pure C++ read-only Windows Registry Hive ("regf") parser for BCD stores (needs zero privileges)
+class RegHiveReader {
+public:
+    bool load(const std::wstring& filePath) {
+        HANDLE h = CreateFileW(filePath.c_str(), GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER li{};
+        if (!GetFileSizeEx(h, &li) || li.QuadPart < 0x1020 || li.QuadPart > (64LL * 1024LL * 1024LL)) {
+            CloseHandle(h);
+            return false;
+        }
+        buf_.resize(static_cast<size_t>(li.QuadPart));
+        DWORD rd = 0;
+        BOOL ok = ReadFile(h, buf_.data(), static_cast<DWORD>(buf_.size()), &rd, nullptr);
+        CloseHandle(h);
+        if (!ok || rd < 0x1020 || std::memcmp(buf_.data(), "regf", 4) != 0) {
+            buf_.clear();
+            return false;
+        }
+        std::memcpy(&rootOff_, buf_.data() + 0x24, 4);
+        return true;
+    }
+
+    uint32_t rootOffset() const { return rootOff_; }
+
+    bool readNk(uint32_t nkOff,
+                std::wstring& outName,
+                std::vector<uint32_t>& outSubkeyOffsets,
+                std::map<std::wstring, BcdElementVal>& outValues) const {
+        outName.clear();
+        outSubkeyOffsets.clear();
+        outValues.clear();
+
+        uint32_t len = 0;
+        const uint8_t* p = cellPayload(nkOff, len);
+        if (!p || len < 0x4Cu || std::memcmp(p, "nk", 2) != 0) return false;
+
+        uint16_t flags = 0;
+        uint16_t nameLen = 0;
+        uint32_t numSub = 0;
+        uint32_t subListOff = 0xFFFFFFFFu;
+        uint32_t numVal = 0;
+        uint32_t valListOff = 0xFFFFFFFFu;
+
+        std::memcpy(&flags, p + 0x02, 2);
+        std::memcpy(&numSub, p + 0x14, 4);
+        std::memcpy(&subListOff, p + 0x1C, 4);
+        std::memcpy(&numVal, p + 0x24, 4);
+        std::memcpy(&valListOff, p + 0x28, 4);
+        std::memcpy(&nameLen, p + 0x48, 2);
+
+        if (0x4Cu + static_cast<uint32_t>(nameLen) > len) return false;
+        outName = decodeKeyOrValName(p + 0x4C, nameLen, (flags & 0x0020u) != 0);
+
+        if (numSub > 0 && subListOff != 0xFFFFFFFFu) {
+            collectSubkeys(subListOff, outSubkeyOffsets, 0);
+        }
+
+        if (numVal > 0 && valListOff != 0xFFFFFFFFu) {
+            uint32_t vlLen = 0;
+            const uint8_t* vl = cellPayload(valListOff, vlLen);
+            if (vl) {
+                for (uint32_t i = 0; i < numVal && (i + 1u) * 4u <= vlLen; ++i) {
+                    uint32_t vkOff = 0;
+                    std::memcpy(&vkOff, vl + i * 4u, 4);
+                    uint32_t vkLen = 0;
+                    const uint8_t* vk = cellPayload(vkOff, vkLen);
+                    if (!vk || vkLen < 0x14u || std::memcmp(vk, "vk", 2) != 0) continue;
+
+                    uint16_t vnLen = 0;
+                    uint16_t vFlags = 0;
+                    uint32_t rawDLen = 0;
+                    uint32_t dOff = 0;
+                    uint32_t dType = 0;
+                    std::memcpy(&vnLen, vk + 0x02, 2);
+                    std::memcpy(&rawDLen, vk + 0x04, 4);
+                    std::memcpy(&dOff, vk + 0x08, 4);
+                    std::memcpy(&dType, vk + 0x0C, 4);
+                    std::memcpy(&vFlags, vk + 0x10, 2);
+                    if (0x14u + static_cast<uint32_t>(vnLen) > vkLen) continue;
+
+                    std::wstring vName = ToLower(decodeKeyOrValName(vk + 0x14, vnLen, (vFlags & 0x0001u) != 0));
+                    BcdElementVal ev{};
+                    ev.dataType = dType;
+                    bool inlineData = (rawDLen & 0x80000000u) != 0;
+                    uint32_t dLen   = rawDLen & 0x7FFFFFFFu;
+                    if (inlineData) {
+                        if (dLen > 4u) dLen = 4u;
+                        ev.raw.resize(dLen);
+                        if (dLen > 0) std::memcpy(ev.raw.data(), &dOff, dLen);
+                    } else if (dLen > 0 && dLen <= (4u * 1024u * 1024u)) {
+                        uint32_t dcLen = 0;
+                        const uint8_t* dc = cellPayload(dOff, dcLen);
+                        if (dc && dcLen > 0) {
+                            uint32_t copyLen = std::min(dLen, dcLen);
+                            ev.raw.assign(dc, dc + copyLen);
+                        }
+                    }
+                    outValues[vName] = std::move(ev);
+                }
+            }
+        }
+        return true;
+    }
+
+private:
+    std::vector<uint8_t> buf_;
+    uint32_t             rootOff_ = 0;
+
+    const uint8_t* cellPayload(uint32_t relOff, uint32_t& outPayloadLen) const {
+        outPayloadLen = 0;
+        if (relOff == 0xFFFFFFFFu) return nullptr;
+        uint64_t pos = 0x1000ULL + static_cast<uint64_t>(relOff);
+        if (pos + 4ULL > buf_.size()) return nullptr;
+        int32_t rawSz = 0;
+        std::memcpy(&rawSz, buf_.data() + pos, 4);
+        int64_t absSz = (rawSz < 0) ? -static_cast<int64_t>(rawSz) : static_cast<int64_t>(rawSz);
+        if (absSz <= 4 || pos + static_cast<uint64_t>(absSz) > buf_.size()) return nullptr;
+        outPayloadLen = static_cast<uint32_t>(absSz - 4);
+        return buf_.data() + pos + 4;
+    }
+
+    static std::wstring decodeKeyOrValName(const uint8_t* p, uint16_t byteLen, bool isAscii) {
+        std::wstring s;
+        if (isAscii) {
+            s.reserve(byteLen);
+            for (uint16_t i = 0; i < byteLen; ++i) {
+                s.push_back(static_cast<wchar_t>(p[i]));
+            }
+        } else {
+            s.reserve(byteLen / 2u);
+            for (uint16_t i = 0; static_cast<uint32_t>(i) + 1u < byteLen; i = static_cast<uint16_t>(i + 2u)) {
+                wchar_t wc = 0;
+                std::memcpy(&wc, p + i, 2);
+                s.push_back(wc);
+            }
+        }
+        return s;
+    }
+
+    void collectSubkeys(uint32_t listOff, std::vector<uint32_t>& out, int depth) const {
+        if (depth > 4) return;
+        uint32_t len = 0;
+        const uint8_t* p = cellPayload(listOff, len);
+        if (!p || len < 4u) return;
+        uint16_t count = 0;
+        std::memcpy(&count, p + 2, 2);
+        if (std::memcmp(p, "lf", 2) == 0 || std::memcmp(p, "lh", 2) == 0) {
+            for (uint32_t i = 0; i < count && 4u + (i + 1u) * 8u <= len; ++i) {
+                uint32_t o = 0;
+                std::memcpy(&o, p + 4u + i * 8u, 4);
+                out.push_back(o);
+            }
+        } else if (std::memcmp(p, "li", 2) == 0) {
+            for (uint32_t i = 0; i < count && 4u + (i + 1u) * 4u <= len; ++i) {
+                uint32_t o = 0;
+                std::memcpy(&o, p + 4u + i * 4u, 4);
+                out.push_back(o);
+            }
+        } else if (std::memcmp(p, "ri", 2) == 0) {
+            for (uint32_t i = 0; i < count && 4u + (i + 1u) * 4u <= len; ++i) {
+                uint32_t sl = 0;
+                std::memcpy(&sl, p + 4u + i * 4u, 4);
+                collectSubkeys(sl, out, depth + 1);
+            }
+        }
+    }
+};
+
+void MergeInheritedBcdElements(const std::wstring& guidLower,
+                               const std::map<std::wstring, BcdObjectNode>& allObjects,
+                               std::map<std::wstring, BcdElementVal>& ioMerged,
+                               std::set<std::wstring>& visited,
+                               int depth) {
+    if (depth > 6 || guidLower.empty() || visited.count(guidLower) > 0) return;
+    visited.insert(guidLower);
+
+    auto itObj = allObjects.find(guidLower);
+    if (itObj == allObjects.end()) return;
+    const BcdObjectNode& node = itObj->second;
+
+    auto itInh = node.elements.find(L"14000006");
+    if (itInh != node.elements.end()) {
+        for (const auto& parentGuid : itInh->second.asMultiSz()) {
+            MergeInheritedBcdElements(ToLower(parentGuid), allObjects, ioMerged, visited, depth + 1);
+        }
+    }
+
+    for (const auto& kv : node.elements) {
+        ioMerged[kv.first] = kv.second;
+    }
+}
+
+std::wstring FindFallbackSdiOnMedia(const std::wstring& mediaRoot,
+                                    const std::wstring& wimFullPath,
+                                    std::wstring& outSdiRelPath) {
+    outSdiRelPath.clear();
+
+    // 1. Check same directory as WIM first (e.g., \SSTR\boot.sdi or \WEPE\WEPE.SDI)
+    std::wstring wimDir  = ParentDirOf(wimFullPath);
+    std::wstring wimStem = StemOf(FileNameOf(wimFullPath));
+    if (!wimDir.empty()) {
+        std::wstring sameStemSdi = JoinPath(wimDir, wimStem + L".sdi");
+        if (FileExistsRegular(sameStemSdi)) {
+            if (ToLower(sameStemSdi).rfind(ToLower(mediaRoot), 0) == 0) {
+                outSdiRelPath = sameStemSdi.substr(mediaRoot.size());
+                if (!outSdiRelPath.empty() && outSdiRelPath.front() != L'\\') outSdiRelPath = L"\\" + outSdiRelPath;
+            }
+            return sameStemSdi;
+        }
+
+        WIN32_FIND_DATAW fd{};
+        HANDLE hFind = FindFirstFileW(JoinPath(wimDir, L"*.sdi").c_str(), &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            std::wstring picked;
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                    std::wstring cand = JoinPath(wimDir, fd.cFileName);
+                    if (_wcsicmp(fd.cFileName, L"boot.sdi") == 0 || picked.empty()) {
+                        picked = cand;
+                        if (_wcsicmp(fd.cFileName, L"boot.sdi") == 0) break;
+                    }
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+            if (!picked.empty()) {
+                if (ToLower(picked).rfind(ToLower(mediaRoot), 0) == 0) {
+                    outSdiRelPath = picked.substr(mediaRoot.size());
+                    if (!outSdiRelPath.empty() && outSdiRelPath.front() != L'\\') outSdiRelPath = L"\\" + outSdiRelPath;
+                }
+                return picked;
+            }
+        }
+    }
+
+    // 2. Standard media locations
+    const wchar_t* relCandidates[] = {
+        L"\\boot\\boot.sdi",
+        L"\\sources\\boot.sdi",
+        L"\\EFI\\boot\\boot.sdi",
+        L"\\EFI\\Microsoft\\Boot\\boot.sdi",
+        L"\\SSTR\\boot.sdi",
+        L"\\WEPE\\WEPE.SDI",
+        L"\\boot.sdi"
+    };
+    for (const wchar_t* rel : relCandidates) {
+        std::wstring full = JoinPath(mediaRoot, rel);
+        if (FileExistsRegular(full)) {
+            outSdiRelPath = rel;
+            return full;
+        }
+    }
+
+    // 3. Any *.sdi at mediaRoot
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(JoinPath(mediaRoot, L"*.sdi").c_str(), &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        std::wstring picked;
+        std::wstring pickedName;
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                picked     = JoinPath(mediaRoot, fd.cFileName);
+                pickedName = fd.cFileName;
+                break;
+            }
+        } while (FindNextFileW(hFind, &fd));
+        FindClose(hFind);
+        if (!picked.empty()) {
+            outSdiRelPath = L"\\" + pickedName;
+            return picked;
+        }
+    }
+
+    return L"";
+}
+
+bool ParseSingleBcdStore(const std::wstring& bcdFilePath,
+                         const std::wstring& mediaRoot,
+                         std::vector<CustomPeBootEntry>& outEntries,
+                         const LogCallback& logCb) {
+    RegHiveReader hive;
+    if (!hive.load(bcdFilePath)) {
+        return false;
+    }
+
+    std::wstring rootName;
+    std::vector<uint32_t> rootSubs;
+    std::map<std::wstring, BcdElementVal> rootVals;
+    if (!hive.readNk(hive.rootOffset(), rootName, rootSubs, rootVals)) {
+        return false;
+    }
+
+    std::map<std::wstring, BcdObjectNode> objects;
+    for (uint32_t rs : rootSubs) {
+        std::wstring sName;
+        std::vector<uint32_t> objSubs;
+        std::map<std::wstring, BcdElementVal> sVals;
+        if (!hive.readNk(rs, sName, objSubs, sVals) || ToLower(sName) != L"objects") continue;
+
+        for (uint32_t objOff : objSubs) {
+            std::wstring guidStr;
+            std::vector<uint32_t> oSubs;
+            std::map<std::wstring, BcdElementVal> oVals;
+            if (!hive.readNk(objOff, guidStr, oSubs, oVals)) continue;
+
+            BcdObjectNode node{};
+            node.guid = ToLower(Trim(guidStr));
+            for (uint32_t subOff : oSubs) {
+                std::wstring kName;
+                std::vector<uint32_t> kSubs;
+                std::map<std::wstring, BcdElementVal> kVals;
+                if (!hive.readNk(subOff, kName, kSubs, kVals)) continue;
+
+                std::wstring lowK = ToLower(kName);
+                if (lowK == L"description") {
+                    auto itT = kVals.find(L"type");
+                    if (itT != kVals.end()) {
+                        node.objType = static_cast<uint32_t>(itT->second.asUint64(0));
+                    }
+                } else if (lowK == L"elements") {
+                    for (uint32_t elOff : kSubs) {
+                        std::wstring elHex;
+                        std::vector<uint32_t> eSubs;
+                        std::map<std::wstring, BcdElementVal> eVals;
+                        if (!hive.readNk(elOff, elHex, eSubs, eVals)) continue;
+                        auto itE = eVals.find(L"element");
+                        if (itE != eVals.end()) {
+                            node.elements[ToLower(Trim(elHex))] = itE->second;
+                        }
+                    }
+                }
+            }
+            if (!node.guid.empty()) {
+                objects[node.guid] = std::move(node);
+            }
+        }
+    }
+
+    if (objects.empty()) return false;
+
+    std::wstring defaultGuid;
+    std::vector<std::wstring> displayOrder;
+    std::map<std::wstring, std::wstring> sdiPathsByGuid;
+    std::wstring anySdiRelPath;
+
+    for (const auto& kv : objects) {
+        const BcdObjectNode& n = kv.second;
+        if (n.objType == 0x10100002u || n.guid == L"{9dea862c-5cdd-4e70-acc1-f32b344d4795}") {
+            auto itDef = n.elements.find(L"23000003");
+            if (itDef != n.elements.end()) defaultGuid = ToLower(itDef->second.asSz());
+            auto itOrd = n.elements.find(L"24000001");
+            if (itOrd != n.elements.end()) {
+                for (const auto& g : itOrd->second.asMultiSz()) {
+                    displayOrder.push_back(ToLower(g));
+                }
+            }
+        } else if (n.objType == 0x30000000u) {
+            auto itSdi = n.elements.find(L"32000004");
+            if (itSdi != n.elements.end()) {
+                std::wstring sp = itSdi->second.asSz();
+                for (auto& ch : sp) {
+                    if (ch == L'/') ch = L'\\';
+                }
+                if (!sp.empty()) {
+                    if (sp.front() != L'\\') sp = L"\\" + sp;
+                    sdiPathsByGuid[n.guid] = sp;
+                    if (anySdiRelPath.empty()) anySdiRelPath = sp;
+                }
+            }
+        }
+    }
+
+    const std::wstring kGlobalSettingsGuid     = L"{7ea2e1ac-2e61-4728-aaa3-896d9d0a9f0e}";
+    const std::wstring kBootloaderSettingsGuid = L"{6efb52bf-1766-41db-a6b3-0ee5eff72bd7}";
+
+    for (const auto& kv : objects) {
+        const BcdObjectNode& n = kv.second;
+        bool isOsLoader = (n.objType == 0x10200003u) || ((n.objType & 0xFFFF0000u) == 0x10200000u);
+        if (!isOsLoader) continue;
+
+        std::map<std::wstring, BcdElementVal> eff;
+        std::set<std::wstring> visited;
+        MergeInheritedBcdElements(kGlobalSettingsGuid, objects, eff, visited, 0);
+        MergeInheritedBcdElements(kBootloaderSettingsGuid, objects, eff, visited, 0);
+        MergeInheritedBcdElements(n.guid, objects, eff, visited, 0);
+
+        std::wstring sdiGuid;
+        std::wstring wimRel;
+        auto itDev = eff.find(L"11000001");
+        bool gotWim = (itDev != eff.end()) && ParseRamdiskDeviceBlob(itDev->second.raw, sdiGuid, wimRel);
+        if (!gotWim) {
+            auto itOsDev = eff.find(L"21000001");
+            gotWim = (itOsDev != eff.end()) && ParseRamdiskDeviceBlob(itOsDev->second.raw, sdiGuid, wimRel);
+        }
+        if (!gotWim || wimRel.empty()) continue;
+
+        if (ToLower(wimRel).rfind(L"[boot]", 0) == 0) {
+            wimRel = wimRel.substr(6);
+            if (!wimRel.empty() && wimRel.front() != L'\\') wimRel = L"\\" + wimRel;
+        }
+
+        std::wstring wimFull = JoinPath(mediaRoot, wimRel);
+        if (!FileExistsRegular(wimFull)) {
+            std::wstring parentRoot = ParentDirOf(mediaRoot);
+            if (!parentRoot.empty() && FileExistsRegular(JoinPath(parentRoot, wimRel))) {
+                wimFull = JoinPath(parentRoot, wimRel);
+            } else {
+                if (logCb) {
+                    logCb(L" • BCD 항목 건너뜀 (미디어 내 WIM 파일 없음): " + wimRel);
+                }
+                continue;
+            }
+        }
+
+        CustomPeBootEntry entry{};
+        entry.bcdGuid     = n.guid;
+        entry.wimRelPath  = wimRel;
+        entry.wimFullPath = wimFull;
+
+        if (!sdiGuid.empty() && sdiPathsByGuid.count(sdiGuid) > 0) {
+            entry.sdiRelPath = sdiPathsByGuid[sdiGuid];
+        } else if (!anySdiRelPath.empty()) {
+            entry.sdiRelPath = anySdiRelPath;
+        }
+
+        if (!entry.sdiRelPath.empty()) {
+            std::wstring candSdi = JoinPath(mediaRoot, entry.sdiRelPath);
+            if (FileExistsRegular(candSdi)) {
+                entry.sdiFullPath = candSdi;
+            }
+        }
+        if (entry.sdiFullPath.empty()) {
+            entry.sdiFullPath = FindFallbackSdiOnMedia(mediaRoot, entry.wimFullPath, entry.sdiRelPath);
+        }
+
+        auto itDesc = eff.find(L"12000004");
+        if (itDesc != eff.end()) entry.description = itDesc->second.asSz();
+        if (entry.description.empty()) {
+            entry.description = StemOf(FileNameOf(entry.wimFullPath));
+        }
+
+        auto itPath = eff.find(L"12000002");
+        if (itPath != eff.end()) entry.loaderPath = itPath->second.asSz();
+
+        auto itSys = eff.find(L"22000002");
+        entry.systemRoot = (itSys != eff.end() && !itSys->second.asSz().empty())
+                           ? itSys->second.asSz()
+                           : L"\\windows";
+
+        auto itWinpe = eff.find(L"26000022");
+        if (itWinpe != eff.end()) {
+            entry.hasWinpeFlag = true;
+            entry.winpeMode    = itWinpe->second.asBool(true);
+        }
+
+        auto itHal = eff.find(L"26000010");
+        if (itHal != eff.end()) {
+            entry.hasDetectHalFlag = true;
+            entry.detectHal        = itHal->second.asBool(true);
+        }
+
+        auto itNx = eff.find(L"25000020");
+        if (itNx != eff.end()) {
+            switch (itNx->second.asUint64()) {
+                case 0: entry.nxPolicy = L"OptIn"; break;
+                case 1: entry.nxPolicy = L"OptOut"; break;
+                case 2: entry.nxPolicy = L"AlwaysOff"; break;
+                case 3: entry.nxPolicy = L"AlwaysOn"; break;
+                default: break;
+            }
+        }
+
+        std::vector<std::wstring> extraTokens;
+        auto itNoInt = eff.find(L"16000048");
+        if (itNoInt != eff.end() && itNoInt->second.asBool(false)) {
+            entry.hasNoIntegrity = true;
+            extraTokens.push_back(L"nointegritychecks yes");
+        }
+
+        auto itTestSig = eff.find(L"16000049");
+        if (itTestSig != eff.end() && itTestSig->second.asBool(false)) {
+            entry.hasTestSigning = true;
+            extraTokens.push_back(L"testsigning yes");
+        }
+
+        auto itLoadOpt = eff.find(L"12000030");
+        if (itLoadOpt != eff.end()) {
+            std::wstring lo = itLoadOpt->second.asSz();
+            if (!lo.empty()) {
+                bool hasSpace = (lo.find(L' ') != std::wstring::npos);
+                extraTokens.push_back(hasSpace ? (L"loadoptions \"" + lo + L"\"") : (L"loadoptions " + lo));
+            }
+        }
+
+        auto itBmp = eff.find(L"250000c2");
+        if (itBmp != eff.end()) {
+            uint64_t bmp = itBmp->second.asUint64();
+            if (bmp == 0) extraTokens.push_back(L"bootmenupolicy Legacy");
+            else if (bmp == 1) extraTokens.push_back(L"bootmenupolicy Standard");
+        }
+
+        auto itEms = eff.find(L"260000b0");
+        if (itEms != eff.end() && itEms->second.asBool(false)) {
+            extraTokens.push_back(L"ems yes");
+        }
+
+        auto itPae = eff.find(L"25000021");
+        if (itPae != eff.end()) {
+            uint64_t pae = itPae->second.asUint64();
+            if (pae == 1) extraTokens.push_back(L"pae ForceEnable");
+            else if (pae == 2) extraTokens.push_back(L"pae ForceDisable");
+        }
+
+        auto itVga = eff.find(L"26000040");
+        if (itVga != eff.end() && itVga->second.asBool(false)) {
+            extraTokens.push_back(L"vga yes");
+        }
+
+        auto itHyp = eff.find(L"250000f0");
+        if (itHyp != eff.end()) {
+            uint64_t hv = itHyp->second.asUint64();
+            if (hv == 0) extraTokens.push_back(L"hypervisorlaunchtype Off");
+            else if (hv == 1) extraTokens.push_back(L"hypervisorlaunchtype Auto");
+        }
+
+        auto itBsp = eff.find(L"250000e0");
+        if (itBsp != eff.end()) {
+            uint64_t bsp = itBsp->second.asUint64();
+            if (bsp == 1) extraTokens.push_back(L"bootstatuspolicy IgnoreAllFailures");
+            else if (bsp == 2) extraTokens.push_back(L"bootstatuspolicy IgnoreShutdownFailures");
+            else if (bsp == 3) extraTokens.push_back(L"bootstatuspolicy IgnoreBootFailures");
+        }
+
+        for (size_t i = 0; i < extraTokens.size(); ++i) {
+            if (i > 0) entry.extraSetArgs += L"; ";
+            entry.extraSetArgs += extraTokens[i];
+        }
+
+        entry.isDefault = (!defaultGuid.empty() && n.guid == defaultGuid);
+        for (size_t idx = 0; idx < displayOrder.size(); ++idx) {
+            if (displayOrder[idx] == n.guid) {
+                entry.displayOrderRank = static_cast<int>(idx);
+                break;
+            }
+        }
+
+        entry.wimInfo = InspectWimFile(entry.wimFullPath);
+        outEntries.push_back(std::move(entry));
+    }
+
+    return !outEntries.empty();
+}
+
+} // namespace
+
+bool MountIsoReadOnly(const std::wstring& isoFullPath,
+                      IsoMountSession& outSession,
+                      const LogCallback& logCb) {
+    outSession = IsoMountSession{};
+    outSession.isoFullPath = isoFullPath;
+
+    if (!FileExistsRegular(isoFullPath)) {
+        if (logCb) logCb(L"오류: 선택한 ISO 파일을 찾을 수 없습니다: " + isoFullPath);
+        return false;
+    }
+
+    if (logCb) logCb(L"커스텀 PE ISO 이미지 마운트 시도 중 (읽기 전용): " + isoFullPath);
+
+    // 1. Primary path: dynamically loaded virtdisk.dll (fast, zero PowerShell startup overhead)
+    HMODULE hVirtDisk = LoadLibraryW(L"virtdisk.dll");
+    if (hVirtDisk) {
+        using FnOpenVirtualDisk = DWORD(WINAPI*)(PVIRTUAL_STORAGE_TYPE, PCWSTR, VIRTUAL_DISK_ACCESS_MASK,
+                                                 OPEN_VIRTUAL_DISK_FLAG, POPEN_VIRTUAL_DISK_PARAMETERS, PHANDLE);
+        using FnAttachVirtualDisk = DWORD(WINAPI*)(HANDLE, PSECURITY_DESCRIPTOR, ATTACH_VIRTUAL_DISK_FLAG,
+                                                   ULONG, PATTACH_VIRTUAL_DISK_PARAMETERS, LPOVERLAPPED);
+        using FnDetachVirtualDisk = DWORD(WINAPI*)(HANDLE, DETACH_VIRTUAL_DISK_FLAG, ULONG);
+        using FnGetVirtualDiskPhysicalPath = DWORD(WINAPI*)(HANDLE, PULONG, PWSTR);
+
+        auto pOpen = reinterpret_cast<FnOpenVirtualDisk>(
+            reinterpret_cast<void*>(GetProcAddress(hVirtDisk, "OpenVirtualDisk")));
+        auto pAttach = reinterpret_cast<FnAttachVirtualDisk>(
+            reinterpret_cast<void*>(GetProcAddress(hVirtDisk, "AttachVirtualDisk")));
+        auto pDetach = reinterpret_cast<FnDetachVirtualDisk>(
+            reinterpret_cast<void*>(GetProcAddress(hVirtDisk, "DetachVirtualDisk")));
+        auto pGetPhys = reinterpret_cast<FnGetVirtualDiskPhysicalPath>(
+            reinterpret_cast<void*>(GetProcAddress(hVirtDisk, "GetVirtualDiskPhysicalPath")));
+
+        if (pOpen && pAttach && pGetPhys) {
+            VIRTUAL_STORAGE_TYPE vst{};
+            vst.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_ISO;
+            // VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT {EC984AEC-A0F9-47e9-901F-71415A66345B}
+            vst.VendorId = { 0xEC984AECu, 0xA0F9u, 0x47E9u, { 0x90, 0x1F, 0x71, 0x41, 0x5A, 0x66, 0x34, 0x5B } };
+
+            HANDLE hVhd = INVALID_HANDLE_VALUE;
+            DWORD st = pOpen(&vst, isoFullPath.c_str(), VIRTUAL_DISK_ACCESS_READ,
+                             OPEN_VIRTUAL_DISK_FLAG_NONE, nullptr, &hVhd);
+            if (st == ERROR_SUCCESS && hVhd != INVALID_HANDLE_VALUE) {
+                wchar_t physBuf[MAX_PATH]{};
+                ULONG physCch = _countof(physBuf);
+                bool alreadyAttached = (pGetPhys(hVhd, &physCch, physBuf) == ERROR_SUCCESS && physBuf[0] != L'\0');
+                DWORD drivesBefore = GetLogicalDrives();
+
+                if (!alreadyAttached) {
+                    st = pAttach(hVhd, nullptr, ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY, 0, nullptr, nullptr);
+                }
+
+                if (alreadyAttached || st == ERROR_SUCCESS) {
+                    std::wstring foundRoot;
+                    for (int attempt = 0; attempt < 40; ++attempt) {
+                        physCch = _countof(physBuf);
+                        physBuf[0] = L'\0';
+                        pGetPhys(hVhd, &physCch, physBuf);
+                        DWORD newMask = alreadyAttached ? 0u : (GetLogicalDrives() & ~drivesBefore);
+                        foundRoot = ResolvePhysicalCdromToDriveRoot(physBuf, newMask);
+                        if (!foundRoot.empty()) {
+                            // Wait briefly until UDF/ISO9660 filesystem is ready
+                            if (GetVolumeInformationW(foundRoot.c_str(), nullptr, 0, nullptr,
+                                                      nullptr, nullptr, nullptr, 0)) {
+                                break;
+                            }
+                        }
+                        Sleep(100);
+                    }
+
+                    if (!foundRoot.empty()) {
+                        outSession.mounted     = true;
+                        outSession.mountedByUs = !alreadyAttached;
+                        outSession.driveRoot   = foundRoot;
+                        if (alreadyAttached) {
+                            CloseHandle(hVhd);
+                            outSession.vhdHandle = INVALID_HANDLE_VALUE;
+                        } else {
+                            outSession.vhdHandle = hVhd; // keep open until UnmountIsoSession
+                        }
+                        FreeLibrary(hVirtDisk);
+                        if (logCb) {
+                            logCb(L"ISO 마운트 확인 완료 -> 드라이브 " + outSession.driveRoot +
+                                  (alreadyAttached ? L" (기존 마운트 사용)" : L" (임시 마운트됨)"));
+                        }
+                        return true;
+                    }
+
+                    if (!alreadyAttached && pDetach) {
+                        pDetach(hVhd, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+                    }
+                }
+                CloseHandle(hVhd);
+            }
+        }
+        FreeLibrary(hVirtDisk);
+    }
+
+    // 2. Fallback path: PowerShell Mount-DiskImage
+    if (logCb) logCb(L"virtdisk 직접 마운트 대신 PowerShell Mount-DiskImage로 재시도합니다...");
+    std::wstring escIso = EscapePsSingleQuoted(isoFullPath);
+    std::wstring psCmd =
+        L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+        L"$p = '" + escIso + L"'; "
+        L"$pre = (Get-DiskImage -ImagePath $p).Attached; "
+        L"if (-not $pre) { Mount-DiskImage -ImagePath $p -StorageType ISO -Access ReadOnly | Out-Null }; "
+        L"$dl = (Get-DiskImage -ImagePath $p | Get-Volume).DriveLetter; "
+        L"Write-Output ('OTPE_ISO=' + [int][bool]$pre + ':' + $dl)\"";
+
+    ExecOutput psOut = RunHiddenProcess(L"WindowsPowerShell\\v1.0\\powershell.exe", psCmd, nullptr);
+    size_t tagPos = psOut.text.find(L"OTPE_ISO=");
+    if (tagPos != std::wstring::npos && tagPos + 12 <= psOut.text.size()) {
+        wchar_t preCh = psOut.text[tagPos + 9];
+        wchar_t drvCh = psOut.text[tagPos + 11];
+        if (std::iswalpha(drvCh)) {
+            wchar_t root[4] = { static_cast<wchar_t>(std::towupper(drvCh)), L':', L'\\', L'\0' };
+            outSession.mounted        = true;
+            outSession.mountedByUs    = (preCh == L'0');
+            outSession.usedPowerShell = true;
+            outSession.driveRoot      = root;
+            if (logCb) logCb(L"PowerShell ISO 마운트 완료 -> 드라이브 " + outSession.driveRoot);
+            return true;
+        }
+    }
+
+    if (logCb) logCb(L"오류: ISO 이미지를 마운트하지 못했습니다.");
+    return false;
+}
+
+void UnmountIsoSession(IsoMountSession& session, const LogCallback& logCb) {
+    if (!session.mounted) return;
+
+    if (session.vhdHandle != INVALID_HANDLE_VALUE) {
+        if (session.mountedByUs) {
+            HMODULE hVirtDisk = LoadLibraryW(L"virtdisk.dll");
+            if (hVirtDisk) {
+                using FnDetachVirtualDisk = DWORD(WINAPI*)(HANDLE, DETACH_VIRTUAL_DISK_FLAG, ULONG);
+                auto pDetach = reinterpret_cast<FnDetachVirtualDisk>(
+                    reinterpret_cast<void*>(GetProcAddress(hVirtDisk, "DetachVirtualDisk")));
+                if (pDetach) {
+                    pDetach(session.vhdHandle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+                }
+                FreeLibrary(hVirtDisk);
+            }
+        }
+        CloseHandle(session.vhdHandle);
+        session.vhdHandle = INVALID_HANDLE_VALUE;
+        if (session.mountedByUs && logCb) {
+            logCb(L"임시 마운트했던 ISO 이미지를 자동 언마운트했습니다 (" + session.driveRoot + L")");
+        }
+    } else if (session.mountedByUs && session.usedPowerShell && !session.isoFullPath.empty()) {
+        std::wstring escIso = EscapePsSingleQuoted(session.isoFullPath);
+        std::wstring psCmd =
+            L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \""
+            L"Dismount-DiskImage -ImagePath '" + escIso + L"' -ErrorAction SilentlyContinue | Out-Null\"";
+        RunHiddenProcess(L"WindowsPowerShell\\v1.0\\powershell.exe", psCmd, nullptr);
+        if (logCb) {
+            logCb(L"임시 마운트했던 ISO 이미지를 자동 언마운트했습니다 (" + session.driveRoot + L")");
+        }
+    }
+
+    session.mounted     = false;
+    session.mountedByUs = false;
+}
+
+CustomPeDiscoveryResult AnalyzeCustomPeMedia(const std::wstring& selectedPath,
+                                             bool preferUefi,
+                                             const LogCallback& logCb) {
+    CustomPeDiscoveryResult res{};
+    std::wstring cleanPath = Trim(selectedPath);
+    if (cleanPath.empty()) {
+        res.errorMsg = L"선택된 경로가 비어 있습니다.";
+        return res;
+    }
+
+    std::wstring explicitBcdPath;
+    std::wstring preferredWimPath;
+    std::wstring mediaRoot;
+
+    if (DirExists(cleanPath)) {
+        mediaRoot = cleanPath;
+        // If user selected a nested folder like ...\EFI\Microsoft\Boot or ...\sources, step up to PE media root
+        for (int step = 0; step < 3; ++step) {
+            std::wstring folderLow = ToLower(FileNameOf(mediaRoot));
+            std::wstring up = ParentDirOf(mediaRoot);
+            if (up.empty()) break;
+            if (folderLow == L"boot" || folderLow == L"microsoft" || folderLow == L"efi" ||
+                folderLow == L"pcat" || folderLow == L"sources") {
+                mediaRoot = up;
+            } else {
+                break;
+            }
+        }
+    } else if (FileExistsRegular(cleanPath)) {
+        std::wstring fnLow = ToLower(FileNameOf(cleanPath));
+        if (EndsWithLower(fnLow, L".wim") || EndsWithLower(fnLow, L".esd")) {
+            preferredWimPath = cleanPath;
+            mediaRoot = ParentDirOf(cleanPath);
+            std::wstring parentNameLow = ToLower(FileNameOf(mediaRoot));
+            if (parentNameLow == L"sources" || parentNameLow == L"boot" ||
+                parentNameLow == L"sstr" || parentNameLow == L"wepe" ||
+                parentNameLow == L"wim" || parentNameLow == L"pe") {
+                std::wstring up = ParentDirOf(mediaRoot);
+                if (!up.empty()) mediaRoot = up;
+            }
+        } else {
+            // Treat as BCD store file
+            explicitBcdPath = cleanPath;
+            mediaRoot = ParentDirOf(cleanPath);
+            for (int step = 0; step < 4; ++step) {
+                std::wstring folderLow = ToLower(FileNameOf(mediaRoot));
+                std::wstring up = ParentDirOf(mediaRoot);
+                if (up.empty()) break;
+                if (folderLow == L"boot" || folderLow == L"microsoft" || folderLow == L"efi" ||
+                    folderLow == L"pcat" || folderLow == L"dvd") {
+                    mediaRoot = up;
+                } else {
+                    break;
+                }
+            }
+        }
+    } else {
+        res.errorMsg = L"선택한 파일 또는 폴더를 찾을 수 없습니다:\n" + cleanPath;
+        return res;
+    }
+
+    res.mediaRoot = mediaRoot;
+    if (logCb) logCb(L"--- 커스텀 PE 미디어 구조 및 BCD 분석 시작 (루트: " + mediaRoot + L") ---");
+
+    // 1. Build ordered list of candidate BCD hives
+    std::vector<std::wstring> bcdCandidates;
+    auto addCandidate = [&](const std::wstring& p) {
+        if (!FileExistsRegular(p)) return;
+        for (const auto& existing : bcdCandidates) {
+            if (_wcsicmp(existing.c_str(), p.c_str()) == 0) return;
+        }
+        bcdCandidates.push_back(p);
+    };
+
+    if (!explicitBcdPath.empty()) addCandidate(explicitBcdPath);
+    if (preferUefi) {
+        addCandidate(JoinPath(mediaRoot, L"EFI\\Microsoft\\Boot\\BCD"));
+        addCandidate(JoinPath(mediaRoot, L"EFI\\Boot\\BCD"));
+        addCandidate(JoinPath(mediaRoot, L"SSTR\\BCD"));
+        addCandidate(JoinPath(mediaRoot, L"boot\\bcd"));
+    } else {
+        addCandidate(JoinPath(mediaRoot, L"boot\\bcd"));
+        addCandidate(JoinPath(mediaRoot, L"SSTR\\BCD"));
+        addCandidate(JoinPath(mediaRoot, L"EFI\\Microsoft\\Boot\\BCD"));
+        addCandidate(JoinPath(mediaRoot, L"EFI\\Boot\\BCD"));
+    }
+    addCandidate(JoinPath(mediaRoot, L"BCD"));
+
+    for (const auto& bcdPath : bcdCandidates) {
+        std::vector<CustomPeBootEntry> parsed;
+        if (ParseSingleBcdStore(bcdPath, mediaRoot, parsed, logCb) && !parsed.empty()) {
+            res.usedBcdPath = bcdPath;
+            res.entries     = std::move(parsed);
+            if (logCb) {
+                logCb(L"BCD 바이너리 하이브 분석 성공: " + bcdPath +
+                      L" (부팅 가능 WIM 항목 " + std::to_wstring(res.entries.size()) + L"개 발견)");
+            }
+            break;
+        }
+    }
+
+    // 2. Fallback: If media has NO BCD store (e.g. extracted WIM + SDI folder), scan for .wim / .sdi directly
+    if (res.entries.empty()) {
+        std::vector<std::wstring> foundWims;
+        auto addWimsInDir = [&](const std::wstring& subRel) {
+            std::wstring dir = subRel.empty() ? mediaRoot : JoinPath(mediaRoot, subRel);
+            if (!DirExists(dir)) return;
+            WIN32_FIND_DATAW fd{};
+            HANDLE hFind = FindFirstFileW(JoinPath(dir, L"*.wim").c_str(), &fd);
+            if (hFind == INVALID_HANDLE_VALUE) return;
+            do {
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                    std::wstring full = JoinPath(dir, fd.cFileName);
+                    bool dup = false;
+                    for (const auto& ex : foundWims) {
+                        if (_wcsicmp(ex.c_str(), full.c_str()) == 0) { dup = true; break; }
+                    }
+                    if (!dup) foundWims.push_back(full);
+                }
+            } while (FindNextFileW(hFind, &fd));
+            FindClose(hFind);
+        };
+
+        if (!preferredWimPath.empty() && FileExistsRegular(preferredWimPath)) {
+            foundWims.push_back(preferredWimPath);
+        }
+        addWimsInDir(L"");
+        addWimsInDir(L"sources");
+        addWimsInDir(L"boot");
+        addWimsInDir(L"SSTR");
+        addWimsInDir(L"WEPE");
+        addWimsInDir(L"WIM");
+        addWimsInDir(L"PE");
+
+        // Filter out huge install.wim if other PE wims exist
+        if (foundWims.size() > 1) {
+            std::vector<std::wstring> nonInstall;
+            for (const auto& w : foundWims) {
+                if (_wcsicmp(FileNameOf(w).c_str(), L"install.wim") != 0) {
+                    nonInstall.push_back(w);
+                }
+            }
+            if (!nonInstall.empty()) foundWims = std::move(nonInstall);
+        }
+
+        for (size_t i = 0; i < foundWims.size(); ++i) {
+            CustomPeBootEntry e{};
+            e.wimFullPath = foundWims[i];
+            if (ToLower(e.wimFullPath).rfind(ToLower(mediaRoot), 0) == 0) {
+                e.wimRelPath = e.wimFullPath.substr(mediaRoot.size());
+                if (!e.wimRelPath.empty() && e.wimRelPath.front() != L'\\') e.wimRelPath = L"\\" + e.wimRelPath;
+            } else {
+                e.wimRelPath = L"\\" + FileNameOf(e.wimFullPath);
+            }
+            e.sdiFullPath      = FindFallbackSdiOnMedia(mediaRoot, e.wimFullPath, e.sdiRelPath);
+            e.wimInfo          = InspectWimFile(e.wimFullPath);
+            e.description      = !e.wimInfo.imageName.empty() ? e.wimInfo.imageName : StemOf(FileNameOf(e.wimFullPath));
+            e.loaderPath       = preferUefi ? L"\\windows\\system32\\winload.efi" : L"\\windows\\system32\\winload.exe";
+            e.systemRoot       = !e.wimInfo.systemRoot.empty() ? e.wimInfo.systemRoot : L"\\windows";
+            e.hasWinpeFlag     = true;
+            e.winpeMode        = true;
+            e.hasDetectHalFlag = true;
+            e.detectHal        = true;
+            e.displayOrderRank = static_cast<int>(i);
+            res.entries.push_back(std::move(e));
+        }
+
+        if (!res.entries.empty()) {
+            res.synthesizedWithoutBcd = true;
+            if (logCb) {
+                logCb(L"참고: 미디어 내 BCD 파일이 없어 폴더 스캔으로 WIM 항목 " +
+                      std::to_wstring(res.entries.size()) + L"개를 구성했습니다.");
+            }
+        }
+    }
+
+    if (res.entries.empty()) {
+        res.errorMsg =
+            L"선택한 경로에서 부팅 가능한 커스텀 PE(.wim) 및 BCD 구성을 찾지 못했습니다.\n\n"
+            L"확인할 경로: " + mediaRoot + L"\n"
+            L"올바른 커스텀 PE .iso 파일, 압축 해제된 PE 루트 폴더, 또는 EFI\\Microsoft\\Boot\\BCD 파일을 선택해 주세요.";
+        return res;
+    }
+
+    // 3. Sort entries: preferredWimPath match -> architecture match (x64 first on UEFI) -> default -> displayOrder
+    std::stable_sort(res.entries.begin(), res.entries.end(),
+                     [&](const CustomPeBootEntry& a, const CustomPeBootEntry& b) {
+                         if (!preferredWimPath.empty()) {
+                             bool aMatch = (_wcsicmp(a.wimFullPath.c_str(), preferredWimPath.c_str()) == 0);
+                             bool bMatch = (_wcsicmp(b.wimFullPath.c_str(), preferredWimPath.c_str()) == 0);
+                             if (aMatch != bMatch) return aMatch;
+                         }
+                         if (preferUefi) {
+                             bool aBadArch = (a.wimInfo.arch == 0);
+                             bool bBadArch = (b.wimInfo.arch == 0);
+                             if (aBadArch != bBadArch) return !aBadArch;
+                         }
+                         if (a.isDefault != b.isDefault) return a.isDefault;
+                         return a.displayOrderRank < b.displayOrderRank;
+                     });
+
+    // 4. Detect external tool folders / markers at mediaRoot
+    const wchar_t* toolMarkers[] = {
+        L"Programs", L"PETools", L"SSTR", L"WEPE", L"DLC1", L"PESoft",
+        L"Y.ini", L"CdUsb.Y", L"Win10XPE.ini", L"HBCD_PE.ini"
+    };
+    for (const wchar_t* mk : toolMarkers) {
+        std::wstring fullMk = JoinPath(mediaRoot, mk);
+        if (GetFileAttributesW(fullMk.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            res.externalToolMarkers.push_back(mk);
+        }
+    }
+
+    res.ok = true;
+    return res;
 }
 
 bool ExportNetworkConfigForPe(const std::wstring& appDir,

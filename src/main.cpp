@@ -111,11 +111,12 @@ AppConfig    g_cfg;
 HWND g_hLblTitle      = nullptr;
 HWND g_hLblSysInfo    = nullptr;
 
-HWND g_hGrpFiles      = nullptr;
-HWND g_hLblAppDir     = nullptr;
-HWND g_hEdtAppDir     = nullptr;
-HWND g_hBtnOpenDir    = nullptr;
-HWND g_hBtnRescan     = nullptr;
+HWND g_hGrpFiles        = nullptr;
+HWND g_hLblAppDir       = nullptr;
+HWND g_hEdtAppDir       = nullptr;
+HWND g_hBtnImportCustom = nullptr;
+HWND g_hBtnOpenDir      = nullptr;
+HWND g_hBtnRescan       = nullptr;
 HWND g_hLblWim        = nullptr;
 HWND g_hCmbWim        = nullptr;
 HWND g_hBtnBrowseWim  = nullptr;
@@ -260,7 +261,7 @@ void PostLogFromWorkerThread(const std::wstring& msg) {
 void SetTaskBusyState(bool busy, const wchar_t* customBtnText = nullptr) {
     g_isTaskBusy = busy;
     const HWND interactive[] = {
-        g_hCmbWim, g_hBtnBrowseWim, g_hCmbSdi, g_hBtnBrowseSdi, g_hBtnGenSdi, g_hBtnRescan,
+        g_hBtnImportCustom, g_hCmbWim, g_hBtnBrowseWim, g_hCmbSdi, g_hBtnBrowseSdi, g_hBtnGenSdi, g_hBtnRescan,
         g_hBtnCheckBl, g_hBtnSyncNet, g_hBtnPatchWim,
         g_hBtnRefreshBcd, g_hBtnSaveCfg, g_hBtnApplyBcd, g_hBtnQueueOnly, g_hBtnCleanBcd, g_hBtnBootNow
     };
@@ -1373,6 +1374,753 @@ void RemoveDirectoryTree(const std::wstring& dirPath) {
     RemoveDirectoryW(dirPath.c_str());
 }
 
+std::wstring FileNameFromPath(const std::wstring& path) {
+    std::wstring p = path;
+    while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+    size_t sl = p.find_last_of(L"\\/");
+    return (sl == std::wstring::npos) ? p : p.substr(sl + 1);
+}
+
+std::wstring StemFromFileName(const std::wstring& fileName) {
+    size_t dot = fileName.find_last_of(L'.');
+    return (dot == std::wstring::npos || dot == 0) ? fileName : fileName.substr(0, dot);
+}
+
+std::wstring SanitizeFileStem(const std::wstring& raw) {
+    std::wstring out;
+    for (wchar_t c : raw) {
+        if (c < 32 || c == L'<' || c == L'>' || c == L':' || c == L'"' ||
+            c == L'/' || c == L'\\' || c == L'|' || c == L'?' || c == L'*') {
+            out.push_back(L'_');
+        } else {
+            out.push_back(c);
+        }
+    }
+    out = Trim(out);
+    while (!out.empty() && out.back() == L'.') out.pop_back();
+    return out.empty() ? L"CustomPE" : out;
+}
+
+bool BrowseForCustomPeFile(std::wstring& outFile) {
+    outFile.clear();
+    HMODULE hComDlg = LoadLibraryW(L"comdlg32.dll");
+    if (!hComDlg) return false;
+    using FnGetOpenFileNameW = BOOL(WINAPI*)(LPOPENFILENAMEW);
+    auto pOpenDlg = reinterpret_cast<FnGetOpenFileNameW>(
+        reinterpret_cast<void*>(GetProcAddress(hComDlg, "GetOpenFileNameW")));
+    bool picked = false;
+    if (pOpenDlg) {
+        wchar_t fileBuf[MAX_PATH * 2]{};
+        OPENFILENAMEW ofn{};
+        ofn.lStructSize     = sizeof(ofn);
+        ofn.hwndOwner       = g_hMainWnd;
+        ofn.lpstrFilter     =
+            L"커스텀 PE 이미지 / BCD / WIM (*.iso;BCD;*.bcd;*.wim)\0*.iso;BCD;*.bcd;*.wim\0"
+            L"ISO 디스크 이미지 (*.iso)\0*.iso\0"
+            L"BCD 부팅 구성 파일 (BCD;*.bcd)\0BCD;*.bcd\0"
+            L"WIM 이미지 파일 (*.wim)\0*.wim\0"
+            L"모든 파일 (*.*)\0*.*\0";
+        ofn.lpstrFile       = fileBuf;
+        ofn.nMaxFile        = _countof(fileBuf);
+        ofn.lpstrInitialDir = g_appDir.c_str();
+        ofn.lpstrTitle      = L"커스텀 PE .ISO 이미지 또는 BCD 파일 선택";
+        ofn.Flags           = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (pOpenDlg(&ofn) && fileBuf[0] != L'\0') {
+            outFile = fileBuf;
+            picked  = true;
+        }
+    }
+    FreeLibrary(hComDlg);
+    return picked;
+}
+
+bool BrowseForCustomPeFolder(std::wstring& outFolder) {
+    outFolder.clear();
+    IFileOpenDialog* pDlg = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&pDlg));
+    if (SUCCEEDED(hr) && pDlg) {
+        DWORD opts = 0;
+        if (SUCCEEDED(pDlg->GetOptions(&opts))) {
+            pDlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        }
+        pDlg->SetTitle(L"커스텀 PE 루트 폴더 선택 (EFI / boot / sources 등이 들어있는 폴더)");
+        if (SUCCEEDED(pDlg->Show(g_hMainWnd))) {
+            IShellItem* pItem = nullptr;
+            if (SUCCEEDED(pDlg->GetResult(&pItem)) && pItem) {
+                PWSTR pszPath = nullptr;
+                if (SUCCEEDED(pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszPath)) && pszPath) {
+                    outFolder = pszPath;
+                    CoTaskMemFree(pszPath);
+                }
+                pItem->Release();
+            }
+        }
+        pDlg->Release();
+        return !outFolder.empty();
+    }
+
+    // Fallback: SHBrowseForFolderW
+    BROWSEINFOW bi{};
+    bi.hwndOwner = g_hMainWnd;
+    bi.lpszTitle = L"커스텀 PE 루트 폴더를 선택하세요:";
+    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+    if (pidl) {
+        wchar_t pathBuf[MAX_PATH * 2]{};
+        if (SHGetPathFromIDListW(pidl, pathBuf) && pathBuf[0] != L'\0') {
+            outFolder = pathBuf;
+        }
+        CoTaskMemFree(pidl);
+    }
+    return !outFolder.empty();
+}
+
+struct ImportSourceDlgState {
+    int  choice = 0; // 0 = cancel, 1 = ISO/BCD file, 2 = Folder
+    bool done   = false;
+};
+
+LRESULT CALLBACK ImportSourceDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* st = reinterpret_cast<ImportSourceDlgState*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCCREATE: {
+            const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+            SetWindowLongPtrW(hDlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return TRUE;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, RGB(246, 248, 250));
+            SetTextColor(hdc, RGB(30, 35, 45));
+            return reinterpret_cast<LRESULT>(g_hBgBrush);
+        }
+        case WM_COMMAND: {
+            const int id = LOWORD(wParam);
+            if (HIWORD(wParam) == BN_CLICKED && st) {
+                if (id == IDC_DLG_BTN_PICK_ISO || id == IDOK) {
+                    st->choice = 1;
+                    st->done   = true;
+                    return 0;
+                }
+                if (id == IDC_DLG_BTN_PICK_DIR) {
+                    st->choice = 2;
+                    st->done   = true;
+                    return 0;
+                }
+                if (id == IDC_DLG_BTN_CANCEL || id == IDCANCEL) {
+                    st->choice = 0;
+                    st->done   = true;
+                    return 0;
+                }
+            }
+            break;
+        }
+        case WM_CLOSE:
+            if (st) {
+                st->choice = 0;
+                st->done   = true;
+            }
+            return 0;
+    }
+    return DefWindowProcW(hDlg, msg, wParam, lParam);
+}
+
+int ShowImportSourceKindDialog() {
+    static bool s_registered = false;
+    constexpr wchar_t kDlgClass[] = L"OneTimePE_ImportSourceDlg";
+    if (!s_registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = ImportSourceDlgProc;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_hBgBrush;
+        wc.lpszClassName = kDlgClass;
+        if (RegisterClassExW(&wc)) s_registered = true;
+    }
+
+    int dlgW = Scale(485);
+    int dlgH = Scale(240);
+    RECT rcParent{};
+    GetWindowRect(g_hMainWnd, &rcParent);
+    int posX = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
+    int posY = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
+
+    ImportSourceDlgState state{};
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, kDlgClass,
+                                L"커스텀 PE 원클릭 자동 분석 및 가져오기",
+                                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                                posX, posY, dlgW, dlgH,
+                                g_hMainWnd, nullptr, g_hInst, &state);
+    if (!hDlg) return 0;
+
+    RECT rcClient{};
+    GetClientRect(hDlg, &rcClient);
+    int cw  = rcClient.right - rcClient.left;
+    int pad = Scale(14);
+    int iw  = cw - pad * 2;
+
+    HWND hDesc = CreateWindowExW(
+        0, L"STATIC",
+        L"커스텀 PE 내부의 EFI\\Microsoft\\Boot\\BCD를 자동으로 분석하여\n"
+        L"전용 .wim + 전용 .sdi + 커스텀 부팅 옵션(nointegritychecks 등)을 세팅합니다.",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        pad, Scale(12), iw, Scale(38), hDlg, nullptr, g_hInst, nullptr);
+
+    HWND hBtnIso = CreateWindowExW(
+        0, L"BUTTON", L"📀  커스텀 PE .ISO 이미지 (또는 BCD) 파일 선택...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        pad, Scale(56), iw, Scale(36), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_PICK_ISO)), g_hInst, nullptr);
+
+    HWND hBtnDir = CreateWindowExW(
+        0, L"BUTTON", L"📁  압축 해제된 커스텀 PE 폴더 / USB 드라이브 선택...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        pad, Scale(98), iw, Scale(36), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_PICK_DIR)), g_hInst, nullptr);
+
+    HWND hTip = CreateWindowExW(
+        0, L"STATIC",
+        L"💡 팁: 탐색기에서 .iso 파일이나 폴더를 메인 창으로 바로 드래그 앤 드롭해도 됩니다.",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        pad, Scale(144), iw - Scale(92), Scale(34), hDlg, nullptr, g_hInst, nullptr);
+
+    HWND hBtnCancel = CreateWindowExW(
+        0, L"BUTTON", L"취소",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        pad + iw - Scale(84), Scale(144), Scale(84), Scale(28), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_CANCEL)), g_hInst, nullptr);
+
+    SendMessageW(hDesc, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+    SendMessageW(hBtnIso, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(hBtnDir, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(hTip, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+    SendMessageW(hBtnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+
+    EnableWindow(g_hMainWnd, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+    SetFocus(hBtnIso);
+
+    MSG msg{};
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    EnableWindow(g_hMainWnd, TRUE);
+    SetForegroundWindow(g_hMainWnd);
+    DestroyWindow(hDlg);
+    return state.choice;
+}
+
+struct EntrySelectDlgState {
+    HWND hList    = nullptr;
+    int  selected = -1;
+    bool done     = false;
+};
+
+LRESULT CALLBACK EntrySelectDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* st = reinterpret_cast<EntrySelectDlgState*>(GetWindowLongPtrW(hDlg, GWLP_USERDATA));
+    switch (msg) {
+        case WM_NCCREATE: {
+            const auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+            SetWindowLongPtrW(hDlg, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return TRUE;
+        }
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = reinterpret_cast<HDC>(wParam);
+            SetBkMode(hdc, OPAQUE);
+            SetBkColor(hdc, RGB(246, 248, 250));
+            SetTextColor(hdc, RGB(30, 35, 45));
+            return reinterpret_cast<LRESULT>(g_hBgBrush);
+        }
+        case WM_COMMAND: {
+            const int id   = LOWORD(wParam);
+            const int code = HIWORD(wParam);
+            if (!st) break;
+            if ((id == IDC_DLG_PE_LIST && code == LBN_DBLCLK) ||
+                ((id == IDC_DLG_BTN_OK || id == IDOK) && code == BN_CLICKED)) {
+                int sel = static_cast<int>(SendMessageW(st->hList, LB_GETCURSEL, 0, 0));
+                if (sel != LB_ERR) {
+                    st->selected = sel;
+                    st->done     = true;
+                }
+                return 0;
+            }
+            if ((id == IDC_DLG_BTN_CANCEL || id == IDCANCEL) && code == BN_CLICKED) {
+                st->selected = -1;
+                st->done     = true;
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE:
+            if (st) {
+                st->selected = -1;
+                st->done     = true;
+            }
+            return 0;
+    }
+    return DefWindowProcW(hDlg, msg, wParam, lParam);
+}
+
+int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& entries) {
+    if (entries.empty()) return -1;
+    if (entries.size() == 1) return 0;
+
+    static bool s_registered = false;
+    constexpr wchar_t kDlgClass[] = L"OneTimePE_EntrySelectDlg";
+    if (!s_registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize        = sizeof(wc);
+        wc.lpfnWndProc   = EntrySelectDlgProc;
+        wc.hInstance     = g_hInst;
+        wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = g_hBgBrush;
+        wc.lpszClassName = kDlgClass;
+        if (RegisterClassExW(&wc)) s_registered = true;
+    }
+
+    int dlgW = Scale(610);
+    int dlgH = Scale(330);
+    RECT rcParent{};
+    GetWindowRect(g_hMainWnd, &rcParent);
+    int posX = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
+    int posY = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
+
+    EntrySelectDlgState state{};
+    HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, kDlgClass,
+                                L"가져올 커스텀 PE 부팅 항목 선택",
+                                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                                posX, posY, dlgW, dlgH,
+                                g_hMainWnd, nullptr, g_hInst, &state);
+    if (!hDlg) return -1;
+
+    RECT rcClient{};
+    GetClientRect(hDlg, &rcClient);
+    int cw  = rcClient.right - rcClient.left;
+    int ch  = rcClient.bottom - rcClient.top;
+    int pad = Scale(14);
+    int iw  = cw - pad * 2;
+
+    HWND hLbl = CreateWindowExW(
+        0, L"STATIC",
+        L"선택한 커스텀 PE의 BCD에서 여러 개의 부팅 이미지가 발견되었습니다. 가져올 항목을 선택하세요:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        pad, Scale(12), iw, Scale(22), hDlg, nullptr, g_hInst, nullptr);
+
+    state.hList = CreateWindowExW(
+        WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+        pad, Scale(38), iw, ch - Scale(92), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_PE_LIST)), g_hInst, nullptr);
+
+    HWND hBtnOk = CreateWindowExW(
+        0, L"BUTTON", L"선택 항목 가져오기",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        pad + iw - Scale(232), ch - Scale(42), Scale(136), Scale(30), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_OK)), g_hInst, nullptr);
+
+    HWND hBtnCancel = CreateWindowExW(
+        0, L"BUTTON", L"취소",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        pad + iw - Scale(88), ch - Scale(42), Scale(88), Scale(30), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_CANCEL)), g_hInst, nullptr);
+
+    SendMessageW(hLbl, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(state.hList, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+    SendMessageW(hBtnOk, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(hBtnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+
+    for (const auto& e : entries) {
+        std::wstring row;
+        if (e.isDefault) row += L"[기본] ";
+        row += e.description + L"  —  " + e.wimRelPath + L" (";
+        if (e.wimInfo.arch == 9) row += L"x64";
+        else if (e.wimInfo.arch == 0) row += (g_isUefi ? L"32비트 x86 · UEFI 부팅불가" : L"x86");
+        else row += L"WIM";
+        if (e.wimInfo.osBuild > 0) row += L", Build " + std::to_wstring(e.wimInfo.osBuild);
+        if (!e.sdiRelPath.empty()) row += L", SDI: " + e.sdiRelPath;
+        row += L")";
+        SendMessageW(state.hList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row.c_str()));
+    }
+    SendMessageW(state.hList, LB_SETHORIZONTALEXTENT, static_cast<WPARAM>(Scale(850)), 0);
+    SendMessageW(state.hList, LB_SETCURSEL, 0, 0);
+
+    EnableWindow(g_hMainWnd, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+    SetFocus(state.hList);
+
+    MSG msg{};
+    while (!state.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (!IsDialogMessageW(hDlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    EnableWindow(g_hMainWnd, TRUE);
+    SetForegroundWindow(g_hMainWnd);
+    DestroyWindow(hDlg);
+    return state.selected;
+}
+
+struct CopyProgressCtx {
+    std::wstring labelName;
+    ULONGLONG    lastTick = 0;
+};
+
+DWORD CALLBACK CopyProgressRoutineUI(LARGE_INTEGER TotalFileSize,
+                                     LARGE_INTEGER TotalBytesTransferred,
+                                     LARGE_INTEGER StreamSize,
+                                     LARGE_INTEGER StreamBytesTransferred,
+                                     DWORD dwStreamNumber,
+                                     DWORD dwCallbackReason,
+                                     HANDLE hSourceFile,
+                                     HANDLE hDestinationFile,
+                                     LPVOID lpData) {
+    (void)StreamSize;
+    (void)StreamBytesTransferred;
+    (void)dwStreamNumber;
+    (void)dwCallbackReason;
+    (void)hSourceFile;
+    (void)hDestinationFile;
+
+    auto* ctx = static_cast<CopyProgressCtx*>(lpData);
+    if (!ctx) return PROGRESS_CONTINUE;
+
+    ULONGLONG now = GetTickCount64();
+    if (now - ctx->lastTick >= 180 || TotalBytesTransferred.QuadPart >= TotalFileSize.QuadPart) {
+        ctx->lastTick = now;
+        if (g_hLblFileStatus && TotalFileSize.QuadPart > 0) {
+            double doneMb  = static_cast<double>(TotalBytesTransferred.QuadPart) / (1024.0 * 1024.0);
+            double totalMb = static_cast<double>(TotalFileSize.QuadPart) / (1024.0 * 1024.0);
+            int pct = static_cast<int>((TotalBytesTransferred.QuadPart * 100LL) / TotalFileSize.QuadPart);
+            wchar_t buf[256]{};
+            swprintf_s(buf, L"커스텀 PE 파일 복사 중: %s (%d%% — %.1f / %.1f MB)...",
+                       ctx->labelName.c_str(), pct, doneMb, totalMb);
+            SetWindowTextW(g_hLblFileStatus, buf);
+            UpdateWindow(g_hLblFileStatus);
+        }
+        MSG msg{};
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) break;
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    return PROGRESS_CONTINUE;
+}
+
+bool CopyFileWithProgressUI(const std::wstring& srcFull,
+                            const std::wstring& dstFull,
+                            const std::wstring& displayLabel) {
+    if (_wcsicmp(srcFull.c_str(), dstFull.c_str()) == 0) return true;
+
+    std::wstring srcSig = net_sync::ComputeFileSignature(srcFull);
+    std::wstring dstSig = net_sync::ComputeFileSignature(dstFull);
+    if (!srcSig.empty() && srcSig == dstSig) {
+        AppendLog(L"동일한 파일이 이미 준비되어 있어 복사를 건너뜁니다: " + dstFull);
+        return true;
+    }
+
+    DWORD dstAttr = GetFileAttributesW(dstFull.c_str());
+    if (dstAttr != INVALID_FILE_ATTRIBUTES && (dstAttr & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(dstFull.c_str(), dstAttr & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    AppendLog(L"파일 복사 중: " + srcFull + L" -> " + dstFull);
+    CopyProgressCtx ctx{};
+    ctx.labelName = displayLabel;
+    BOOL cancelFlag = FALSE;
+    HCURSOR prevCur = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    BOOL ok = CopyFileExW(srcFull.c_str(), dstFull.c_str(),
+                          CopyProgressRoutineUI, &ctx, &cancelFlag, 0);
+    SetCursor(prevCur);
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        DeleteFileW(dstFull.c_str());
+        wchar_t errMsg[512]{};
+        swprintf_s(errMsg,
+                   L"커스텀 PE 파일 복사에 실패했습니다. (오류 코드: %lu)\n대상 경로: %s\n디스크 여유 공간 및 권한을 확인해 주세요.",
+                   err, dstFull.c_str());
+        AppendLog(errMsg);
+        MessageBoxW(g_hMainWnd, errMsg, L"커스텀 PE 복사 실패", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    DWORD newAttr = GetFileAttributesW(dstFull.c_str());
+    if (newAttr != INVALID_FILE_ATTRIBUTES && (newAttr & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(dstFull.c_str(), newAttr & ~FILE_ATTRIBUTE_READONLY);
+    }
+    if (newAttr != INVALID_FILE_ATTRIBUTES && (newAttr & FILE_ATTRIBUTE_COMPRESSED)) {
+        RunSystemTool(L"compact.exe", L"/u \"" + dstFull + L"\"", false);
+    }
+    return true;
+}
+
+void ImportCustomPeFromPath(const std::wstring& selectedPath) {
+    if (g_isTaskBusy) return;
+    std::wstring cleanSel = Trim(selectedPath);
+    if (cleanSel.empty()) return;
+
+    DWORD selAttr = GetFileAttributesW(cleanSel.c_str());
+    if (selAttr == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(g_hMainWnd,
+                    (L"선택한 파일 또는 폴더를 찾을 수 없습니다:\n" + cleanSel).c_str(),
+                    L"경로 오류", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    bool isDir = (selAttr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    std::wstring lowSel = ToLower(cleanSel);
+    bool isIso = !isDir && lowSel.size() >= 4 && lowSel.substr(lowSel.size() - 4) == L".iso";
+
+    net_sync::IsoMountSession isoSession{};
+    struct IsoGuard {
+        net_sync::IsoMountSession& s;
+        ~IsoGuard() {
+            net_sync::UnmountIsoSession(s, [](const std::wstring& m) { AppendLog(m); });
+        }
+    } isoGuard{ isoSession };
+
+    std::wstring analyzeTarget = cleanSel;
+    if (isIso) {
+        if (!net_sync::MountIsoReadOnly(cleanSel, isoSession, [](const std::wstring& m) { AppendLog(m); })) {
+            MessageBoxW(g_hMainWnd,
+                        (L"선택한 ISO 이미지를 마운트할 수 없습니다:\n" + cleanSel +
+                         L"\n\n탐색기에서 ISO 파일을 우클릭 -> [탑재] 한 뒤 마운트된 드라이브 폴더를 선택해 보세요.").c_str(),
+                        L"ISO 마운트 실패", MB_ICONERROR | MB_OK);
+            return;
+        }
+        analyzeTarget = isoSession.driveRoot;
+    }
+
+    net_sync::CustomPeDiscoveryResult disc = net_sync::AnalyzeCustomPeMedia(
+        analyzeTarget, g_isUefi, [](const std::wstring& m) { AppendLog(m); });
+    if (!disc.ok || disc.entries.empty()) {
+        MessageBoxW(g_hMainWnd, disc.errorMsg.c_str(), L"커스텀 PE 분석 실패", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    int chosenIdx = SelectCustomPeEntryDialog(disc.entries);
+    if (chosenIdx < 0 || chosenIdx >= static_cast<int>(disc.entries.size())) {
+        AppendLog(L"커스텀 PE 가져오기가 취소되었습니다.");
+        return;
+    }
+
+    const net_sync::CustomPeBootEntry& entry = disc.entries[static_cast<size_t>(chosenIdx)];
+    if (g_isUefi && entry.wimInfo.arch == 0) {
+        int cont = MessageBoxW(
+            g_hMainWnd,
+            L"선택한 커스텀 PE 항목은 [32비트(x86) WinPE] 이미지입니다.\n"
+            L"현재 PC는 64비트 UEFI 모드이므로 이 이미지로는 부팅할 수 없습니다(0xc000000f).\n\n"
+            L"그래도 가져오기를 계속하시겠습니까?",
+            L"32비트(x86) 커스텀 PE 경고", MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
+        if (cont != IDYES) return;
+    }
+
+    // Decide whether to copy WIM + SDI to local internal storage or link in-place
+    ResolvedFileInfo srcWimInfo = ResolvePeFile(entry.wimFullPath);
+    bool mustCopy = isIso ||
+                    (srcWimInfo.driveType != DRIVE_FIXED) ||
+                    IsExternalUsbOrCardBus(srcWimInfo.busType) ||
+                    IsFileBackedVirtualBus(srcWimInfo.busType) ||
+                    !IsBootSupportedFileSystem(srcWimInfo.fileSystem);
+
+    std::wstring wimStem = StemFromFileName(FileNameFromPath(entry.wimFullPath));
+    std::wstring pairStem;
+    if (_wcsicmp(wimStem.c_str(), L"boot") != 0 && !wimStem.empty()) {
+        pairStem = SanitizeFileStem(wimStem);
+    } else if (isIso) {
+        pairStem = SanitizeFileStem(StemFromFileName(FileNameFromPath(cleanSel)));
+    } else {
+        std::wstring rootName = FileNameFromPath(disc.mediaRoot);
+        if (rootName.size() > 3 && _wcsicmp(rootName.c_str(), L"boot") != 0) {
+            pairStem = SanitizeFileStem(rootName);
+        } else {
+            pairStem = L"custom_pe";
+        }
+    }
+    if (_wcsicmp(pairStem.c_str(), L"boot") == 0) {
+        pairStem = L"custom_pe";
+    }
+
+    std::wstring finalWimPath = entry.wimFullPath;
+    std::wstring finalSdiPath = entry.sdiFullPath;
+
+    if (mustCopy) {
+        // Choose destination: g_appDir if it sits on an internal fixed NTFS/FAT32 volume, else C:\OneTimePE_Cache
+        std::wstring localTargetDir = g_appDir;
+        std::wstring appDrv = GetAppDirDriveColon();
+        bool appDirBootSafe = false;
+        if (!appDrv.empty()) {
+            std::wstring rootSlash = appDrv + L"\\";
+            UINT dt = GetDriveTypeW(rootSlash.c_str());
+            STORAGE_BUS_TYPE bt = QueryVolumeStorageBusType(appDrv);
+            wchar_t fsBuf[64]{};
+            GetVolumeInformationW(rootSlash.c_str(), nullptr, 0, nullptr, nullptr, nullptr, fsBuf, _countof(fsBuf));
+            appDirBootSafe = (dt == DRIVE_FIXED) && !IsExternalUsbOrCardBus(bt) &&
+                             !IsFileBackedVirtualBus(bt) && IsBootSupportedFileSystem(fsBuf);
+        }
+        if (!appDirBootSafe) {
+            localTargetDir = GetSystemDriveColon() + L"\\OneTimePE_Cache";
+            CreateDirectoryW(localTargetDir.c_str(), nullptr);
+            DWORD ca = GetFileAttributesW(localTargetDir.c_str());
+            if (ca != INVALID_FILE_ATTRIBUTES && (ca & FILE_ATTRIBUTE_COMPRESSED)) {
+                RunSystemTool(L"compact.exe", L"/u /s:\"" + localTargetDir + L"\"", false);
+            }
+        }
+
+        std::wstring dstWim = JoinPath(localTargetDir, pairStem + L".wim");
+        std::wstring dstSdi = JoinPath(localTargetDir, pairStem + L".sdi");
+
+        SetTaskBusyState(true, L"커스텀PE 복사중...");
+        bool copyOk = true;
+        if (!entry.sdiFullPath.empty() && GetFileAttributesW(entry.sdiFullPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            copyOk = CopyFileWithProgressUI(entry.sdiFullPath, dstSdi, pairStem + L".sdi");
+        } else {
+            AppendLog(L"참고: 커스텀 PE 미디어 내에 별도 .sdi 파일이 없어 Windows 내장 SDI로 대체 생성합니다.");
+            CopyBuiltInBootSdi();
+            dstSdi = JoinPath(g_appDir, L"boot.sdi");
+        }
+        if (copyOk) {
+            copyOk = CopyFileWithProgressUI(entry.wimFullPath, dstWim, pairStem + L".wim");
+        }
+        SetTaskBusyState(false);
+
+        if (!copyOk) {
+            UpdateFileStatusBanner();
+            return;
+        }
+        finalWimPath = dstWim;
+        finalSdiPath = dstSdi;
+
+        // Unmount ISO immediately now that files are safely staged locally
+        net_sync::UnmountIsoSession(isoSession, [](const std::wstring& m) { AppendLog(m); });
+    } else {
+        if (finalSdiPath.empty() || GetFileAttributesW(finalSdiPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            CopyBuiltInBootSdi();
+            finalSdiPath = JoinPath(g_appDir, L"boot.sdi");
+        }
+        for (const std::wstring& fp : { finalWimPath, finalSdiPath }) {
+            DWORD fa = GetFileAttributesW(fp.c_str());
+            if (fa != INVALID_FILE_ATTRIBUTES && (fa & FILE_ATTRIBUTE_READONLY)) {
+                SetFileAttributesW(fp.c_str(), fa & ~FILE_ATTRIBUTE_READONLY);
+            }
+            if (fa != INVALID_FILE_ATTRIBUTES && (fa & FILE_ATTRIBUTE_COMPRESSED)) {
+                RunSystemTool(L"compact.exe", L"/u \"" + fp + L"\"", false);
+            }
+        }
+        AppendLog(L"내장 고정 디스크 경로의 커스텀 PE 파일을 복사 없이 직접 연결했습니다.");
+    }
+
+    // Populate UI controls from imported Custom PE entry
+    ScanLocalPeFiles(true);
+    SetWindowTextW(g_hCmbWim, MakeAppRelativeIfInside(finalWimPath).c_str());
+    SetWindowTextW(g_hCmbSdi, MakeAppRelativeIfInside(finalSdiPath).c_str());
+
+    std::wstring desc = !entry.description.empty() ? entry.description : (pairStem + L" PE");
+    SetWindowTextW(g_hEdtDesc, desc.c_str());
+
+    std::wstring sysRoot = !entry.wimInfo.systemRoot.empty()
+                           ? entry.wimInfo.systemRoot
+                           : (!entry.systemRoot.empty() ? entry.systemRoot : L"\\windows");
+    SetWindowTextW(g_hEdtSysRoot, sysRoot.c_str());
+
+    std::wstring ldr = NormalizeLoaderPathForFirmware(entry.loaderPath, g_isUefi);
+    uint32_t probeIdx = (entry.wimInfo.bootIndex > 0)
+                        ? entry.wimInfo.bootIndex
+                        : ((entry.wimInfo.imageCount > 0) ? entry.wimInfo.imageCount : 1u);
+    std::wstring verifiedLdr = net_sync::DetectPreferredLoaderPathInWim(finalWimPath, probeIdx, g_isUefi, ldr);
+    if (!verifiedLdr.empty()) {
+        ldr = verifiedLdr;
+    }
+    SetWindowTextW(g_hCmbLoader, ldr.c_str());
+
+    bool useWinpe = entry.hasWinpeFlag ? entry.winpeMode : true;
+    bool useHal   = entry.hasDetectHalFlag ? entry.detectHal : true;
+    SendMessageW(g_hChkWinpe, BM_SETCHECK, useWinpe ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(g_hChkDetectHal, BM_SETCHECK, useHal ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    int nxSel = 0;
+    if (_wcsicmp(entry.nxPolicy.c_str(), L"OptIn") == 0) nxSel = 1;
+    else if (_wcsicmp(entry.nxPolicy.c_str(), L"OptOut") == 0) nxSel = 2;
+    else if (_wcsicmp(entry.nxPolicy.c_str(), L"AlwaysOff") == 0) nxSel = 3;
+    else if (_wcsicmp(entry.nxPolicy.c_str(), L"AlwaysOn") == 0) nxSel = 4;
+    SendMessageW(g_hCmbNx, CB_SETCURSEL, nxSel, 0);
+
+    // Ensure custom PE signature bypass option (nointegritychecks yes) is included in ExtraSetArgs
+    std::wstring extra = entry.extraSetArgs;
+    if (ToLower(extra).find(L"nointegritychecks") == std::wstring::npos) {
+        extra = extra.empty() ? L"nointegritychecks yes" : (L"nointegritychecks yes; " + extra);
+    }
+    SetWindowTextW(g_hEdtExtra, extra.c_str());
+
+    // Keep custom PE WIM 100% untouched by default (disable DISM auto-network patch prompt unless user enables it)
+    SendMessageW(g_hChkAutoNet, BM_SETCHECK, BST_UNCHECKED, 0);
+
+    SaveConfigToIni(false);
+    UpdateFileStatusBanner();
+
+    AppendLog(L"★ 커스텀 PE 원클릭 세팅 완료: [" + desc + L"] WIM=" + finalWimPath + L", SDI=" + finalSdiPath);
+
+    std::wstring summary = L"커스텀 PE 분석 및 원클릭 부팅 세팅이 완료되었습니다!\n\n";
+    summary += L"• 부팅 항목명 : " + desc + L"\n";
+    summary += L"• 분석된 구성 : " + (disc.synthesizedWithoutBcd ? L"(폴더 내 WIM/SDI 직접 매칭)" : disc.usedBcdPath) + L"\n";
+    summary += L"• 전용 WIM    : " + MakeAppRelativeIfInside(finalWimPath) + L"\n";
+    summary += L"• 전용 SDI    : " + MakeAppRelativeIfInside(finalSdiPath) + L" (순정 SDI와 충돌 방지됨)\n";
+    summary += L"• 부트 로더   : " + ldr + L"\n";
+    summary += L"• 커스텀 옵션 : " + extra + L"\n";
+    summary += L"• 원본 보존   : 커스텀 WIM 변형 방지를 위해 'PE 부팅 시 네트워크 자동 적용(DISM 패치)'은 기본 해제되었습니다.\n";
+
+    if (mustCopy && !disc.externalToolMarkers.empty()) {
+        std::wstring mkList;
+        for (size_t i = 0; i < disc.externalToolMarkers.size(); ++i) {
+            if (i > 0) mkList += L", ";
+            mkList += disc.externalToolMarkers[i];
+        }
+        summary += L"\n💡 외부 도구 폴더 감지 (" + mkList + L"):\n"
+                   L"   부팅 자체는 지금 바로 가능하며, PE 부팅 후 외부 포터블 프로그램까지 불러오려면 원본의 해당 폴더를 내장 드라이브 루트(예: C:\\ 또는 D:\\)에 복사해 두세요.\n";
+    }
+
+    g_secureBootState = DetectSecureBootState();
+    if (g_isUefi && g_secureBootState == 1) {
+        summary += L"\n⚠ 중요 — 현재 UEFI Secure Boot가 [켜짐] 상태입니다!\n"
+                   L"   개조/구형 커스텀 PE의 winload.efi는 Secure Boot가 켜져 있으면 0xc000000f 또는 0xc0000428 오류로 차단될 수 있습니다.\n"
+                   L"   부팅 오류가 발생할 경우 BIOS 설정(삼성 노트북 F2 → Boot → Secure Boot Control → Disabled)에서 Secure Boot를 잠시 꺼주세요.";
+        MessageBoxW(g_hMainWnd, summary.c_str(), L"커스텀 PE 가져오기 완료 (Secure Boot 안내 포함)",
+                    MB_ICONWARNING | MB_OK);
+    } else {
+        summary += L"\n이제 하단의 [▶ 저장 후 지금 PE 재부팅] 또는 [1회성 예약만] 버튼을 누르면 바로 부팅됩니다.";
+        MessageBoxW(g_hMainWnd, summary.c_str(), L"커스텀 PE 가져오기 완료",
+                    MB_ICONINFORMATION | MB_OK);
+    }
+}
+
+void ActionImportCustomPe() {
+    if (g_isTaskBusy) return;
+    int kind = ShowImportSourceKindDialog();
+    if (kind == 1) {
+        std::wstring filePath;
+        if (BrowseForCustomPeFile(filePath)) {
+            ImportCustomPeFromPath(filePath);
+        }
+    } else if (kind == 2) {
+        std::wstring folderPath;
+        if (BrowseForCustomPeFolder(folderPath)) {
+            ImportCustomPeFromPath(folderPath);
+        }
+    }
+}
+
 bool StageFilesToInternalCache(ResolvedFileInfo& ioWim, ResolvedFileInfo& ioSdi) {
     std::wstring sysDrv = GetSystemDriveColon();
     if (sysDrv.empty()) return false;
@@ -1727,6 +2475,7 @@ bool RegisterOrUpdateBcdEntries(ResolvedFileInfo& wimInfo,
     }
 
     if (!g_cfg.extraSetArgs.empty()) {
+        g_secureBootState = DetectSecureBootState();
         size_t start = 0;
         while (start < g_cfg.extraSetArgs.size()) {
             size_t semi = g_cfg.extraSetArgs.find(L';', start);
@@ -1735,9 +2484,17 @@ bool RegisterOrUpdateBcdEntries(ResolvedFileInfo& wimInfo,
                                       : g_cfg.extraSetArgs.substr(start, semi - start));
             if (!token.empty()) {
                 if (RunSystemTool(L"bcdedit.exe", L"/set \"" + g_cfg.peGuid + L"\" " + token).exitCode != 0) {
-                    MessageBoxW(g_hMainWnd, (L"추가 변수 적용 실패: " + token).c_str(),
-                                L"추가 변수 오류", MB_ICONWARNING | MB_OK);
-                    return false;
+                    std::wstring lowTok = ToLower(token);
+                    bool isSbProtectedOpt = (lowTok.rfind(L"nointegritychecks", 0) == 0 ||
+                                             lowTok.rfind(L"testsigning", 0) == 0);
+                    if (isSbProtectedOpt && g_isUefi && g_secureBootState == 1) {
+                        AppendLog(L"참고: 현재 UEFI Secure Boot가 켜져 있어 보안 정책에 의해 '" + token +
+                                  L"' 옵션은 생략되었습니다. (서명되지 않은 개조 커스텀 PE 부팅 시 0xc000000f/0xc0000428 오류가 나면 BIOS[F2]에서 Secure Boot를 꺼주세요.)");
+                    } else {
+                        MessageBoxW(g_hMainWnd, (L"추가 변수 적용 실패: " + token).c_str(),
+                                    L"추가 변수 오류", MB_ICONWARNING | MB_OK);
+                        return false;
+                    }
                 }
             }
             if (semi == std::wstring::npos) break;
@@ -2020,7 +2777,7 @@ void ApplyFontsToControls() {
 
     const HWND boldCtrls[] = {
         g_hGrpFiles, g_hGrpVars, g_hGrpNet, g_hGrpActions, g_hGrpLog,
-        g_hLblSecStatus, g_hLblNetStatus, g_hBtnBootNow
+        g_hBtnImportCustom, g_hLblSecStatus, g_hLblNetStatus, g_hBtnBootNow
     };
     for (HWND h : boldCtrls) {
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
@@ -2037,7 +2794,7 @@ void LayoutControls(int clientW, int clientH) {
     const int rowH = Scale(24);
     const int labelW = Scale(80);
 
-    HDWP hdwp = BeginDeferWindowPos(55);
+    HDWP hdwp = BeginDeferWindowPos(60);
     auto place = [&](HWND h, int x, int y, int w, int hgt) {
         if (h) hdwp = DeferWindowPos(hdwp, h, nullptr, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE);
     };
@@ -2058,11 +2815,15 @@ void LayoutControls(int clientW, int clientH) {
     int btnGap = Scale(6);
 
     int r1Y = g1Y + Scale(22);
+    int importBtnW = Scale(146);
+    int dirBtnW    = Scale(80);
     place(g_hLblAppDir, inX, r1Y + Scale(3), labelW, Scale(20));
-    int edtDirW = inW - labelW - (btnW * 2 + btnGap * 2);
+    int edtDirW = inW - labelW - (importBtnW + dirBtnW * 2 + btnGap * 3);
     place(g_hEdtAppDir, inX + labelW, r1Y, edtDirW, rowH);
-    place(g_hBtnOpenDir, inX + labelW + edtDirW + btnGap, r1Y, btnW, rowH);
-    place(g_hBtnRescan, inX + labelW + edtDirW + btnGap * 2 + btnW, r1Y, btnW, rowH);
+    int r1BtnX = inX + labelW + edtDirW + btnGap;
+    place(g_hBtnImportCustom, r1BtnX, r1Y, importBtnW, rowH);
+    place(g_hBtnOpenDir, r1BtnX + importBtnW + btnGap, r1Y, dirBtnW, rowH);
+    place(g_hBtnRescan, r1BtnX + importBtnW + btnGap * 2 + dirBtnW, r1Y, dirBtnW, rowH);
 
     int r2Y = r1Y + Scale(30);
     place(g_hLblWim, inX, r2Y + Scale(3), labelW, Scale(20));
@@ -2212,7 +2973,7 @@ void PopulateInitialValues() {
     SetWindowTextW(g_hEdtRebootSec, std::to_wstring(g_cfg.rebootDelaySec).c_str());
     SetWindowTextW(g_hEdtExtra, g_cfg.extraSetArgs.c_str());
     SendMessageW(g_hEdtExtra, EM_SETCUEBANNER, FALSE,
-                 reinterpret_cast<LPARAM>(L"선택 입력 — 예: ems no; bootmenupolicy Legacy"));
+                 reinterpret_cast<LPARAM>(L"선택 입력 — 예: nointegritychecks yes; bootmenupolicy Legacy"));
 
     SendMessageW(g_hChkAutoNet, BM_SETCHECK, g_cfg.autoApplyNetwork ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_hChkExportDrv, BM_SETCHECK, g_cfg.exportNicDrivers ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -2258,11 +3019,12 @@ void CreateAllControls(HWND hWnd) {
     g_hLblSysInfo = mkStatic(L"", SS_RIGHT, IDC_LBL_SYSINFO);
 
     // Group 1
-    g_hGrpFiles      = mkGroup(L"1. PE 파일 인식 (실행 파일과 같은 폴더 자동 탐색 / 파일 드래그 앤 드롭 지원)");
-    g_hLblAppDir     = mkStatic(L"현재 폴더:", SS_LEFT);
-    g_hEdtAppDir     = mkEdit(IDC_EDT_APPDIR, ES_AUTOHSCROLL | ES_READONLY);
-    g_hBtnOpenDir    = mkBtn(L"폴더 열기", IDC_BTN_OPENDIR);
-    g_hBtnRescan     = mkBtn(L"다시 스캔", IDC_BTN_RESCAN);
+    g_hGrpFiles        = mkGroup(L"1. PE 파일 인식 (같은 폴더 자동 탐색 / 커스텀PE .iso · 폴더 · 파일 드래그 앤 드롭 지원)");
+    g_hLblAppDir       = mkStatic(L"현재 폴더:", SS_LEFT);
+    g_hEdtAppDir       = mkEdit(IDC_EDT_APPDIR, ES_AUTOHSCROLL | ES_READONLY);
+    g_hBtnImportCustom = mkBtn(L"★ 커스텀PE 가져오기", IDC_BTN_IMPORT_CUSTOM);
+    g_hBtnOpenDir      = mkBtn(L"폴더 열기", IDC_BTN_OPENDIR);
+    g_hBtnRescan       = mkBtn(L"다시 스캔", IDC_BTN_RESCAN);
 
     g_hLblWim        = mkStatic(L"WIM 파일:", SS_LEFT);
     g_hCmbWim        = mkCombo(IDC_CMB_WIM, CBS_DROPDOWN | CBS_AUTOHSCROLL);
@@ -2341,12 +3103,26 @@ void HandleDroppedFiles(HDROP hDrop) {
         DragFinish(hDrop);
         return;
     }
+    std::wstring customImportTarget;
     UINT count = DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
     for (UINT i = 0; i < count; ++i) {
-        wchar_t path[MAX_PATH]{};
+        wchar_t path[MAX_PATH * 2]{};
         if (DragQueryFileW(hDrop, i, path, _countof(path)) > 0) {
             std::wstring dropped(path);
+            DWORD attr = GetFileAttributesW(dropped.c_str());
             std::wstring low = ToLower(dropped);
+            std::wstring fnLow = ToLower(FileNameFromPath(dropped));
+
+            if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+                customImportTarget = dropped;
+                break;
+            }
+            if ((low.size() >= 4 && low.substr(low.size() - 4) == L".iso") ||
+                fnLow == L"bcd" ||
+                (low.size() >= 4 && low.substr(low.size() - 4) == L".bcd")) {
+                customImportTarget = dropped;
+                break;
+            }
             if (low.size() >= 4 && low.substr(low.size() - 4) == L".wim") {
                 SetWindowTextW(g_hCmbWim, MakeAppRelativeIfInside(dropped).c_str());
                 AppendLog(L"드래그 앤 드롭으로 WIM 지정됨: " + dropped);
@@ -2357,7 +3133,12 @@ void HandleDroppedFiles(HDROP hDrop) {
         }
     }
     DragFinish(hDrop);
-    UpdateFileStatusBanner();
+    if (!customImportTarget.empty()) {
+        AppendLog(L"드래그 앤 드롭으로 커스텀 PE 미디어 감지됨: " + customImportTarget);
+        ImportCustomPeFromPath(customImportTarget);
+    } else {
+        UpdateFileStatusBanner();
+    }
 }
 
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2380,7 +3161,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case WM_CLOSE: {
             if (g_isTaskBusy) {
                 MessageBoxW(hWnd,
-                            L"현재 WIM 이미지 마운트/패치 작업이 진행 중입니다.\n이미지 손상 방지를 위해 완료될 때까지 잠시만 기다려 주세요.",
+                            L"현재 PE 이미지 작업(복사/변환/패치)이 진행 중입니다.\n이미지 손상 방지를 위해 완료될 때까지 잠시만 기다려 주세요.",
                             L"작업 진행 중", MB_ICONWARNING | MB_OK);
                 return 0;
             }
@@ -2556,6 +3337,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
             if (code == BN_CLICKED) {
                 switch (id) {
+                    case IDC_BTN_IMPORT_CUSTOM:
+                        ActionImportCustomPe();
+                        break;
+
                     case IDC_BTN_OPENDIR:
                         ShellExecuteW(hWnd, L"open", g_appDir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                         break;
