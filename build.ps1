@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$NoSync,   # 로컬에서 소스를 직접 수정 중일 때 원격 동기화를 건너뛰는 옵션
     [switch]$Sync      # 하위 호환성 유지 (기본값으로 자동 동기화됨)
 )
