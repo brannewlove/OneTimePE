@@ -21,9 +21,11 @@
 #include "net_sync.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cwctype>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <map>
 #include <set>
 
@@ -3259,7 +3261,10 @@ bool ParseAsciiDriveMapIni(const std::wstring& iniPathOnVol,
 
     int count = 0;
     auto cntIt = dmIt->second.find("Count");
-    if (cntIt != dmIt->second.end()) count = std::atoi(cntIt->second.c_str());
+    if (cntIt != dmIt->second.end()) {
+        try { count = std::stoi(cntIt->second); }
+        catch (...) { count = std::atoi(cntIt->second.c_str()); }
+    }
 
     for (int i = 0; i < count && i < 26; ++i) {
         auto sIt = secs.find("Drive" + std::to_string(i));
@@ -3282,11 +3287,20 @@ bool ParseAsciiDriveMapIni(const std::wstring& iniPathOnVol,
             if (!t.volumeGuid.empty() && t.volumeGuid.back() != L'\\') t.volumeGuid += L'\\';
         }
         auto soIt = kv.find("StartOffset");
-        if (soIt != kv.end()) t.startOffset = std::atoll(soIt->second.c_str());
+        if (soIt != kv.end()) {
+            try { t.startOffset = std::stoll(soIt->second); }
+            catch (...) { t.startOffset = std::strtoll(soIt->second.c_str(), nullptr, 10); }
+        }
         auto elIt = kv.find("ExtentLength");
-        if (elIt != kv.end()) t.extentLen = std::atoll(elIt->second.c_str());
+        if (elIt != kv.end()) {
+            try { t.extentLen = std::stoll(elIt->second); }
+            catch (...) { t.extentLen = std::strtoll(elIt->second.c_str(), nullptr, 10); }
+        }
         auto srIt = kv.find("VolumeSerial");
-        if (srIt != kv.end()) t.serial = static_cast<DWORD>(std::strtoul(srIt->second.c_str(), nullptr, 16));
+        if (srIt != kv.end()) {
+            try { t.serial = static_cast<DWORD>(std::stoul(srIt->second, nullptr, 16)); }
+            catch (...) { t.serial = static_cast<DWORD>(std::strtoul(srIt->second.c_str(), nullptr, 16)); }
+        }
         outTargets.push_back(std::move(t));
     }
     return !outTargets.empty();

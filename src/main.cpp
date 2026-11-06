@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <cstdlib>
 #include <cwctype>
 #include <cstdio>
 #include <cstring>
