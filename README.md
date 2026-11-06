@@ -1,8 +1,8 @@
-# OneTimePE - 1회성 내장 WinPE 부팅 & 무인 네트워크 매니저
+# OneTimePE - 1회성 내장 WinPE & 커스텀PE 매니저
 
 USB 이동식 드라이브 없이 내장 드라이브의 폴더에 PE 파일(`*.wim`, `*.sdi`)을 넣고, **다음 1회 재부팅만 WinPE로 부팅한 뒤 다시 재부팅하면 자동으로 기존 Windows로 복귀**하도록 해 주는 순수 Win32 C++20 네이티브 단일 실행 파일 앱입니다.
 
-현재 실행 중인 Windows의 **네트워크 설정(유선/무선, 고정 IP·서브넷·게이트웨이·DNS, Wi-Fi 프로필 XML, 물리 랜카드 `.inf` 드라이버)** 을 자동으로 읽어들이고, `boot.wim`에 **무인 자동 실행 패치**를 적용하여 PE 부팅 직후 별도 조작 없이 인터넷/내부망이 즉시 연결되도록 지원합니다.
+**[★ 커스텀PE 가져오기]** 기능을 통해 커스텀 PE `.iso` 파일이나 폴더의 내부 `BCD`를 분석해 전용 `.wim` + 전용 `.sdi` + 부팅 옵션(`nointegritychecks` 등)을 원클릭 세팅할 수 있으며, 선택 옵션으로 **PE 부팅 시 기존 드라이브 문자(`C:` 등) 미설정·숨김·오프라인 속성(케이스 B) 자동 복구 패치** 및 **무인 네트워크 자동 연결**을 지원합니다.
 
 ## 폴더 구조
 
@@ -42,6 +42,8 @@ OneTimePE/
 
 | 항목 | 설명 |
 | --- | --- |
+| **★ 커스텀PE 가져오기** | 커스텀 PE `.iso` / 폴더 / `BCD` 분석 후 전용 `.wim` + 전용 `.sdi` + 커스텀 부팅 옵션 원클릭 매칭, 가져오기 시 **`C:` 드라이브 문자 자동 복구 패치** 선택 가능 |
+| **C: 드라이브 문자 자동 복구** | PE 부팅 초기(`X:\Windows\System32\OneTimePE_Helper.exe`)에 디스크/볼륨 `offline`·`readonly`·`hidden`·`nodefaultdriveletter` 해제 및 EFI 문자 선점 분리 후 원래 Windows 파티션을 `C:`로 고정 복원 |
 | **WIM / SDI 파일** | 같은 폴더(및 하위 `sources\`, `boot\`)의 `.wim`, `.sdi` 자동 탐색 및 드래그 앤 드롭 지원 |
 | **부팅 이름 (`description`)** | BCD에 등록될 엔트리 설명 문자열 (기본값: `One-Time WinPE`) |
 | **로더 경로 (`path`)** | 현재 시스템이 UEFI인지 Legacy BIOS인지 자동 감지하여 `winload.efi` / `winload.exe` 기본 선택 |

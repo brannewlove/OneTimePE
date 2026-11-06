@@ -31,10 +31,10 @@
 
 namespace {
 
-constexpr wchar_t kAppVersion[]      = L"v1.2";
+constexpr wchar_t kAppVersion[]      = L"v1.3";
 constexpr wchar_t kBuildTimestamp[]  = OTPE_WIDE(__DATE__) L" " OTPE_WIDE(__TIME__);
 constexpr wchar_t kWindowClassName[] = L"OneTimePE_MainWindow";
-constexpr wchar_t kWindowTitle[]     = L"OneTimePE v1.2 (커스텀PE 지원) - 1회성 내장 WinPE & 무인 네트워크 매니저";
+constexpr wchar_t kWindowTitle[]     = L"OneTimePE v1.3 (커스텀PE & C: 자동복구) - 1회성 WinPE & 무인 부팅 매니저";
 constexpr wchar_t kIniSection[]      = L"OneTimePE";
 
 struct AppConfig {
@@ -52,6 +52,7 @@ struct AppConfig {
     std::wstring extraSetArgs       = L"";
     bool autoApplyNetwork           = true;
     bool exportNicDrivers           = true;
+    bool importPatchDriveFix        = true;
     std::wstring patchedWimPath     = L"";
     std::wstring patchedWimSig      = L"";
     std::wstring sdiGuid            = L"";
@@ -81,15 +82,18 @@ enum class PostPatchFollowUp {
 
 enum class AsyncWimTaskKind {
     UnattendedNetPatch,
+    CustomImportDriveFixPatch,
     ConvertEsdToWim
 };
 
 struct AsyncWimTaskResult {
-    AsyncWimTaskKind  kind     = AsyncWimTaskKind::UnattendedNetPatch;
-    bool              success  = false;
+    AsyncWimTaskKind  kind           = AsyncWimTaskKind::UnattendedNetPatch;
+    bool              success        = false;
     std::wstring      wimPath;
     std::wstring      newSig;
-    PostPatchFollowUp followUp = PostPatchFollowUp::None;
+    PostPatchFollowUp followUp       = PostPatchFollowUp::None;
+    std::wstring      customSummary;
+    bool              warnSecureBoot = false;
 };
 
 // Global UI state
@@ -557,11 +561,16 @@ ResolvedFileInfo ResolvePeFile(const std::wstring& rawInput) {
 }
 
 bool IsWimCurrentlyPatched(const ResolvedFileInfo& wimInfo) {
-    if (!wimInfo.exists || g_cfg.patchedWimSig.empty()) {
+    if (!wimInfo.exists) {
         return false;
     }
-    std::wstring curSig = net_sync::ComputeFileSignature(wimInfo.fullPath);
-    return !curSig.empty() && (curSig == g_cfg.patchedWimSig);
+    if (!g_cfg.patchedWimSig.empty()) {
+        std::wstring curSig = net_sync::ComputeFileSignature(wimInfo.fullPath);
+        if (!curSig.empty() && curSig == g_cfg.patchedWimSig) {
+            return true;
+        }
+    }
+    return net_sync::IsWimUnattendedPatched(wimInfo.fullPath, 0);
 }
 
 std::wstring DecodeConsoleOutput(const std::string& bytes) {
@@ -758,6 +767,7 @@ void LoadConfigFromIni() {
     g_cfg.extraSetArgs         = ReadIniStr(L"ExtraSetArgs", L"");
     g_cfg.autoApplyNetwork     = ReadIniInt(L"AutoApplyNetwork", 1) != 0;
     g_cfg.exportNicDrivers     = ReadIniInt(L"ExportNicDrivers", 1) != 0;
+    g_cfg.importPatchDriveFix  = ReadIniInt(L"ImportPatchDriveFix", 1) != 0;
     g_cfg.patchedWimPath       = ReadIniStr(L"PatchedWimPath", L"");
     g_cfg.patchedWimSig        = ReadIniStr(L"PatchedWimSig", L"");
     g_cfg.sdiGuid              = ReadIniStr(L"SdiGuid", L"");
@@ -840,6 +850,7 @@ bool SaveConfigToIni(bool logSaved = true) {
     WriteIniStr(L"ExtraSetArgs", g_cfg.extraSetArgs);
     WriteIniStr(L"AutoApplyNetwork", g_cfg.autoApplyNetwork ? L"1" : L"0");
     WriteIniStr(L"ExportNicDrivers", g_cfg.exportNicDrivers ? L"1" : L"0");
+    WriteIniStr(L"ImportPatchDriveFix", g_cfg.importPatchDriveFix ? L"1" : L"0");
     WriteIniStr(L"PatchedWimPath", g_cfg.patchedWimPath);
     WriteIniStr(L"PatchedWimSig", g_cfg.patchedWimSig);
     WriteIniStr(L"SdiGuid", g_cfg.sdiGuid);
@@ -889,13 +900,13 @@ void UpdateNetworkStatusBanner(const ResolvedFileInfo& wimInfo) {
     if (!g_hLblNetStatus) return;
     net_sync::DetectedNetworkSummary net = net_sync::DetectActiveWindowsNetwork();
 
-    std::wstring txt = (net.foundAny ? L"✔ 연결됨: " : L"⚠ ") + net.shortBannerText + L"  |  WIM 무인패치: ";
+    std::wstring txt = (net.foundAny ? L"✔ 연결됨: " : L"⚠ ") + net.shortBannerText + L"  |  WIM 패치: ";
     if (!wimInfo.exists) {
         txt += L"WIM 미선택";
     } else if (IsWimCurrentlyPatched(wimInfo)) {
-        txt += L"✔ 패치 완료";
+        txt += L"✔ 적용 완료 (C: 자동복구 + 무인부팅)";
     } else {
-        txt += L"[미적용 — 최초 1회 패치 필요]";
+        txt += L"[미적용 — C: 자동복구/무인연결 시 패치 필요]";
     }
 
     SetWindowTextW(g_hLblNetStatus, txt.c_str());
@@ -1141,6 +1152,23 @@ void ActionSyncWindowsNetworkNow(bool showMessageBox, const std::wstring& target
     }
 }
 
+void SyncDriveMapAndBridgeForPe(const std::wstring& targetWimPath = L"") {
+    PullControlsToConfig();
+    std::wstring exportBaseDir = g_appDir;
+    if (!targetWimPath.empty()) {
+        size_t sl = targetWimPath.find_last_of(L"\\/");
+        if (sl != std::wstring::npos) {
+            std::wstring wimParent = targetWimPath.substr(0, sl);
+            if (ToLower(wimParent).find(L"onetimepe_cache") != std::wstring::npos) {
+                exportBaseDir = wimParent;
+            }
+        }
+    }
+    std::wstring relAppDir = GetNormalizedBcdRelativeDir(exportBaseDir);
+    net_sync::ExportDriveMapForPe(relAppDir, g_cfg.autoApplyNetwork,
+                                  [](const std::wstring& m) { AppendLog(m); });
+}
+
 void StartAsyncWimPatch(PostPatchFollowUp followUp) {
     if (g_isTaskBusy) return;
     PullControlsToConfig();
@@ -1154,16 +1182,20 @@ void StartAsyncWimPatch(PostPatchFollowUp followUp) {
 
     if (followUp == PostPatchFollowUp::None) {
         std::wstring ask =
-            L"선택한 WIM 이미지에 '무인 네트워크 자동 실행 패치'를 적용하시겠습니까?\n\n"
+            L"선택한 WIM 이미지에 [기존 드라이브 문자(C: 등) 자동 복구 + 무인 부팅 패치]를 적용하시겠습니까?\n\n"
             L"• 대상 파일: " + wimInfo.fullPath + L"\n"
-            L"• 수행 작업: DISM 마운트 → startnet.cmd / winpeshl.ini / Startup 자동 실행 훅 + 부트 로더 보정 → 저장(Commit)\n"
-            L"• 최초 1회만 적용하면 이후에는 재패치 없이 매 부팅마다 최신 네트워크가 자동 연결됩니다.\n\n"
+            L"• 수행 작업:\n"
+            L"   1) PE 부팅 시 숨김/문자충돌/오프라인 속성을 자동 해제하고 원래 Windows 파티션을 C: 로 고정 복원\n"
+            L"   2) startnet.cmd / winpeshl.ini / PECMD.INI / Startup 부팅 훅 + 부트 로더 경로 보정\n"
+            L"   3) 'PE 부팅 시 현재 네트워크 자동 적용' 체크 시 드라이버·IP·Wi-Fi 자동 동기화 지원\n\n"
             L"계속하시겠습니까? (약 20~60초 소요)";
-        if (MessageBoxW(g_hMainWnd, ask.c_str(), L"WIM 무인 자동 실행 패치 확인",
+        if (MessageBoxW(g_hMainWnd, ask.c_str(), L"WIM 자동 복구 & 무인 부팅 패치 확인",
                         MB_ICONQUESTION | MB_YESNO) != IDYES) {
             return;
         }
     }
+
+    SyncDriveMapAndBridgeForPe(wimInfo.fullPath);
 
     SetTaskBusyState(true, L"WIM 패치 진행중...");
     std::wstring appDirCopy  = g_appDir;
@@ -1482,8 +1514,10 @@ bool BrowseForCustomPeFolder(std::wstring& outFolder) {
 }
 
 struct ImportSourceDlgState {
-    int  choice = 0; // 0 = cancel, 1 = ISO/BCD file, 2 = Folder
-    bool done   = false;
+    HWND hChkFixDrv     = nullptr;
+    int  choice         = 0; // 0 = cancel, 1 = ISO/BCD file, 2 = Folder
+    bool patchFixDrives = true;
+    bool done           = false;
 };
 
 LRESULT CALLBACK ImportSourceDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1505,11 +1539,17 @@ LRESULT CALLBACK ImportSourceDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
             const int id = LOWORD(wParam);
             if (HIWORD(wParam) == BN_CLICKED && st) {
                 if (id == IDC_DLG_BTN_PICK_ISO || id == IDOK) {
+                    if (st->hChkFixDrv) {
+                        st->patchFixDrives = (SendMessageW(st->hChkFixDrv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    }
                     st->choice = 1;
                     st->done   = true;
                     return 0;
                 }
                 if (id == IDC_DLG_BTN_PICK_DIR) {
+                    if (st->hChkFixDrv) {
+                        st->patchFixDrives = (SendMessageW(st->hChkFixDrv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    }
                     st->choice = 2;
                     st->done   = true;
                     return 0;
@@ -1532,7 +1572,7 @@ LRESULT CALLBACK ImportSourceDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM 
     return DefWindowProcW(hDlg, msg, wParam, lParam);
 }
 
-int ShowImportSourceKindDialog() {
+int ShowImportSourceKindDialog(bool& ioPatchFixDrives) {
     static bool s_registered = false;
     constexpr wchar_t kDlgClass[] = L"OneTimePE_ImportSourceDlg";
     if (!s_registered) {
@@ -1546,14 +1586,15 @@ int ShowImportSourceKindDialog() {
         if (RegisterClassExW(&wc)) s_registered = true;
     }
 
-    int dlgW = Scale(485);
-    int dlgH = Scale(240);
+    int dlgW = Scale(515);
+    int dlgH = Scale(292);
     RECT rcParent{};
     GetWindowRect(g_hMainWnd, &rcParent);
     int posX = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
     int posY = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
 
     ImportSourceDlgState state{};
+    state.patchFixDrives = ioPatchFixDrives;
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, kDlgClass,
                                 L"커스텀 PE 원클릭 자동 분석 및 가져오기",
                                 WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -1577,30 +1618,46 @@ int ShowImportSourceKindDialog() {
     HWND hBtnIso = CreateWindowExW(
         0, L"BUTTON", L"📀  커스텀 PE .ISO 이미지 (또는 BCD) 파일 선택...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-        pad, Scale(56), iw, Scale(36), hDlg,
+        pad, Scale(54), iw, Scale(36), hDlg,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_PICK_ISO)), g_hInst, nullptr);
 
     HWND hBtnDir = CreateWindowExW(
         0, L"BUTTON", L"📁  압축 해제된 커스텀 PE 폴더 / USB 드라이브 선택...",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        pad, Scale(98), iw, Scale(36), hDlg,
+        pad, Scale(96), iw, Scale(36), hDlg,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_PICK_DIR)), g_hInst, nullptr);
+
+    state.hChkFixDrv = CreateWindowExW(
+        0, L"BUTTON",
+        L"PE 부팅 시 기존 드라이브 문자(C: 등) 자동 복구 패치 함께 적용 (권장)",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        pad, Scale(142), iw, Scale(22), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_CHK_FIX_DRV)), g_hInst, nullptr);
+    SendMessageW(state.hChkFixDrv, BM_SETCHECK, ioPatchFixDrives ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    HWND hChkSub = CreateWindowExW(
+        0, L"STATIC",
+        L"   └ 숨김/오프라인 속성 해제 및 EFI 문자 선점 분리로 C: 미설정(케이스 B) 자동 해결",
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        pad, Scale(165), iw, Scale(20), hDlg, nullptr, g_hInst, nullptr);
 
     HWND hTip = CreateWindowExW(
         0, L"STATIC",
         L"💡 팁: 탐색기에서 .iso 파일이나 폴더를 메인 창으로 바로 드래그 앤 드롭해도 됩니다.",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
-        pad, Scale(144), iw - Scale(92), Scale(34), hDlg, nullptr, g_hInst, nullptr);
+        pad, Scale(198), iw - Scale(92), Scale(34), hDlg, nullptr, g_hInst, nullptr);
 
     HWND hBtnCancel = CreateWindowExW(
         0, L"BUTTON", L"취소",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-        pad + iw - Scale(84), Scale(144), Scale(84), Scale(28), hDlg,
+        pad + iw - Scale(84), Scale(198), Scale(84), Scale(28), hDlg,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_BTN_CANCEL)), g_hInst, nullptr);
 
     SendMessageW(hDesc, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
     SendMessageW(hBtnIso, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
     SendMessageW(hBtnDir, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(state.hChkFixDrv, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
+    SendMessageW(hChkSub, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
     SendMessageW(hTip, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
     SendMessageW(hBtnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
 
@@ -1620,13 +1677,18 @@ int ShowImportSourceKindDialog() {
     EnableWindow(g_hMainWnd, TRUE);
     SetForegroundWindow(g_hMainWnd);
     DestroyWindow(hDlg);
+    if (state.choice != 0) {
+        ioPatchFixDrives = state.patchFixDrives;
+    }
     return state.choice;
 }
 
 struct EntrySelectDlgState {
-    HWND hList    = nullptr;
-    int  selected = -1;
-    bool done     = false;
+    HWND hList          = nullptr;
+    HWND hChkFixDrv     = nullptr;
+    int  selected       = -1;
+    bool patchFixDrives = true;
+    bool done           = false;
 };
 
 LRESULT CALLBACK EntrySelectDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1652,6 +1714,9 @@ LRESULT CALLBACK EntrySelectDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 ((id == IDC_DLG_BTN_OK || id == IDOK) && code == BN_CLICKED)) {
                 int sel = static_cast<int>(SendMessageW(st->hList, LB_GETCURSEL, 0, 0));
                 if (sel != LB_ERR) {
+                    if (st->hChkFixDrv) {
+                        st->patchFixDrives = (SendMessageW(st->hChkFixDrv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                    }
                     st->selected = sel;
                     st->done     = true;
                 }
@@ -1674,7 +1739,8 @@ LRESULT CALLBACK EntrySelectDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hDlg, msg, wParam, lParam);
 }
 
-int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& entries) {
+int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& entries,
+                              bool& ioPatchFixDrives) {
     if (entries.empty()) return -1;
     if (entries.size() == 1) return 0;
 
@@ -1691,14 +1757,15 @@ int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& en
         if (RegisterClassExW(&wc)) s_registered = true;
     }
 
-    int dlgW = Scale(610);
-    int dlgH = Scale(330);
+    int dlgW = Scale(625);
+    int dlgH = Scale(360);
     RECT rcParent{};
     GetWindowRect(g_hMainWnd, &rcParent);
     int posX = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
     int posY = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
 
     EntrySelectDlgState state{};
+    state.patchFixDrives = ioPatchFixDrives;
     HWND hDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, kDlgClass,
                                 L"가져올 커스텀 PE 부팅 항목 선택",
                                 WS_POPUP | WS_CAPTION | WS_SYSMENU,
@@ -1722,8 +1789,16 @@ int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& en
     state.hList = CreateWindowExW(
         WS_EX_CLIENTEDGE, L"LISTBOX", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_HSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-        pad, Scale(38), iw, ch - Scale(92), hDlg,
+        pad, Scale(38), iw, ch - Scale(120), hDlg,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_PE_LIST)), g_hInst, nullptr);
+
+    state.hChkFixDrv = CreateWindowExW(
+        0, L"BUTTON",
+        L"PE 부팅 시 기존 드라이브 문자(C: 등) 자동 복구 패치 함께 적용 (권장)",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+        pad, ch - Scale(74), iw, Scale(22), hDlg,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_DLG_CHK_FIX_DRV)), g_hInst, nullptr);
+    SendMessageW(state.hChkFixDrv, BM_SETCHECK, ioPatchFixDrives ? BST_CHECKED : BST_UNCHECKED, 0);
 
     HWND hBtnOk = CreateWindowExW(
         0, L"BUTTON", L"선택 항목 가져오기",
@@ -1739,6 +1814,7 @@ int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& en
 
     SendMessageW(hLbl, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
     SendMessageW(state.hList, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
+    SendMessageW(state.hChkFixDrv, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
     SendMessageW(hBtnOk, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
     SendMessageW(hBtnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontNormal), TRUE);
 
@@ -1773,6 +1849,9 @@ int SelectCustomPeEntryDialog(const std::vector<net_sync::CustomPeBootEntry>& en
     EnableWindow(g_hMainWnd, TRUE);
     SetForegroundWindow(g_hMainWnd);
     DestroyWindow(hDlg);
+    if (state.selected >= 0) {
+        ioPatchFixDrives = state.patchFixDrives;
+    }
     return state.selected;
 }
 
@@ -1871,7 +1950,7 @@ bool CopyFileWithProgressUI(const std::wstring& srcFull,
     return true;
 }
 
-void ImportCustomPeFromPath(const std::wstring& selectedPath) {
+void ImportCustomPeFromPath(const std::wstring& selectedPath, int patchChoiceMode = -1) {
     if (g_isTaskBusy) return;
     std::wstring cleanSel = Trim(selectedPath);
     if (cleanSel.empty()) return;
@@ -1915,11 +1994,34 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
         return;
     }
 
-    int chosenIdx = SelectCustomPeEntryDialog(disc.entries);
+    bool applyDriveFix = (patchChoiceMode == 1) ? true
+                       : ((patchChoiceMode == 0) ? false : g_cfg.importPatchDriveFix);
+
+    int chosenIdx = SelectCustomPeEntryDialog(disc.entries, applyDriveFix);
     if (chosenIdx < 0 || chosenIdx >= static_cast<int>(disc.entries.size())) {
         AppendLog(L"커스텀 PE 가져오기가 취소되었습니다.");
         return;
     }
+
+    // When imported via Drag & Drop with a single boot entry (no dialog shown yet), let user choose Drive-Fix patch
+    if (patchChoiceMode == -1 && disc.entries.size() == 1) {
+        UINT defBtn = applyDriveFix ? MB_DEFBUTTON1 : MB_DEFBUTTON2;
+        int patchAns = MessageBoxW(
+            g_hMainWnd,
+            L"가져올 커스텀 PE 이미지에 [기존 드라이브 문자(C: 등) 자동 복구 패치]를 함께 적용하시겠습니까?\n\n"
+            L"• [예(Y)] (권장) : 패치 함께 적용\n"
+            L"   └ PE 부팅 시 디스크/볼륨 숨김·오프라인 속성 해제 및 EFI 문자 선점 분리로 C: 미설정(케이스 B) 자동 해결\n"
+            L"• [아니오(N)] : 패치 미적용 (원본 WIM 100% 보존 상태로 가져오기)\n"
+            L"• [취소] : 커스텀 PE 가져오기 취소",
+            L"커스텀 PE 가져오기 — C: 드라이브 자동 복구 선택",
+            MB_ICONQUESTION | MB_YESNOCANCEL | defBtn);
+        if (patchAns == IDCANCEL) {
+            AppendLog(L"커스텀 PE 가져오기가 취소되었습니다.");
+            return;
+        }
+        applyDriveFix = (patchAns == IDYES);
+    }
+    g_cfg.importPatchDriveFix = applyDriveFix;
 
     const net_sync::CustomPeBootEntry& entry = disc.entries[static_cast<size_t>(chosenIdx)];
     if (g_isUefi && entry.wimInfo.arch == 0) {
@@ -1932,9 +2034,23 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
         if (cont != IDYES) return;
     }
 
-    // Decide whether to copy WIM + SDI to local internal storage or link in-place
+    auto isInsideDirCaseInsensitive = [](const std::wstring& filePath, const std::wstring& dirPath) -> bool {
+        if (dirPath.empty() || filePath.size() <= dirPath.size()) return false;
+        if (_wcsnicmp(filePath.c_str(), dirPath.c_str(), dirPath.size()) != 0) return false;
+        wchar_t lastDirCh = dirPath.back();
+        if (lastDirCh == L'\\' || lastDirCh == L'/') return true;
+        wchar_t sep = filePath[dirPath.size()];
+        return (sep == L'\\' || sep == L'/');
+    };
+    std::wstring cacheCheckDir = GetSystemDriveColon() + L"\\OneTimePE_Cache";
+    bool alreadyInManagedDir = isInsideDirCaseInsensitive(entry.wimFullPath, g_appDir) ||
+                               isInsideDirCaseInsensitive(entry.wimFullPath, cacheCheckDir);
+
+    // Decide whether to copy WIM + SDI to local internal storage or link in-place.
+    // When applyDriveFix is enabled, always stage external unpacked folders into g_appDir / Cache so user's original WIM stays untouched.
     ResolvedFileInfo srcWimInfo = ResolvePeFile(entry.wimFullPath);
     bool mustCopy = isIso ||
+                    (applyDriveFix && !alreadyInManagedDir) ||
                     (srcWimInfo.driveType != DRIVE_FIXED) ||
                     IsExternalUsbOrCardBus(srcWimInfo.busType) ||
                     IsFileBackedVirtualBus(srcWimInfo.busType) ||
@@ -2069,10 +2185,17 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
     }
     SetWindowTextW(g_hEdtExtra, extra.c_str());
 
-    // Keep custom PE WIM 100% untouched by default (disable DISM auto-network patch prompt unless user enables it)
+    // Keep auto-network unchecked by default on Custom PE unless user explicitly turns it on
     SendMessageW(g_hChkAutoNet, BM_SETCHECK, BST_UNCHECKED, 0);
 
+    bool alreadyPatched = net_sync::IsWimUnattendedPatched(finalWimPath, probeIdx);
+    if (alreadyPatched) {
+        g_cfg.patchedWimPath = finalWimPath;
+        g_cfg.patchedWimSig  = net_sync::ComputeFileSignature(finalWimPath);
+    }
+
     SaveConfigToIni(false);
+    SyncDriveMapAndBridgeForPe(finalWimPath);
     UpdateFileStatusBanner();
 
     AppendLog(L"★ 커스텀 PE 원클릭 세팅 완료: [" + desc + L"] WIM=" + finalWimPath + L", SDI=" + finalSdiPath);
@@ -2084,7 +2207,14 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
     summary += L"• 전용 SDI    : " + MakeAppRelativeIfInside(finalSdiPath) + L" (순정 SDI와 충돌 방지됨)\n";
     summary += L"• 부트 로더   : " + ldr + L"\n";
     summary += L"• 커스텀 옵션 : " + extra + L"\n";
-    summary += L"• 원본 보존   : 커스텀 WIM 변형 방지를 위해 'PE 부팅 시 네트워크 자동 적용(DISM 패치)'은 기본 해제되었습니다.\n";
+    if (applyDriveFix) {
+        summary += L"• C: 자동복구 : 활성화됨 (PE 부팅 시 숨김/오프라인 해제 및 C: 문자 선점 자동 분리)\n";
+        summary += L"• 네트워크    : 'PE 부팅 시 현재 네트워크 자동 적용'은 기본 해제됨 (원할 때 체크 가능)\n";
+    } else if (alreadyPatched) {
+        summary += L"• C: 자동복구 : 활성화됨 (해당 WIM에 이미 자동복구 패치가 포함되어 있음)\n";
+    } else {
+        summary += L"• C: 자동복구 : 미적용 (선택 해제됨 — 원본 WIM 100% 무수정 보존)\n";
+    }
 
     if (mustCopy && !disc.externalToolMarkers.empty()) {
         std::wstring mkList;
@@ -2097,14 +2227,51 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
     }
 
     g_secureBootState = DetectSecureBootState();
-    if (g_isUefi && g_secureBootState == 1) {
+    bool warnSb = (g_isUefi && g_secureBootState == 1);
+    if (warnSb) {
         summary += L"\n⚠ 중요 — 현재 UEFI Secure Boot가 [켜짐] 상태입니다!\n"
                    L"   개조/구형 커스텀 PE의 winload.efi는 Secure Boot가 켜져 있으면 0xc000000f 또는 0xc0000428 오류로 차단될 수 있습니다.\n"
                    L"   부팅 오류가 발생할 경우 BIOS 설정(삼성 노트북 F2 → Boot → Secure Boot Control → Disabled)에서 Secure Boot를 잠시 꺼주세요.";
+    } else {
+        summary += L"\n이제 하단의 [▶ 저장 후 지금 PE 재부팅] 또는 [1회성 예약만] 버튼을 누르면 바로 부팅됩니다.";
+    }
+
+    if (applyDriveFix && !alreadyPatched) {
+        if (!g_isAdmin) {
+            AppendLog(L"⚠ 관리자 권한이 없어 WIM 내부 [C: 드라이브 자동 복구 패치]를 생략했습니다.");
+            summary += L"\n\n⚠ 관리자 권한이 아니므로 WIM 패치는 적용되지 않았습니다. 관리자 권한으로 실행 후 [WIM 자동복구 패치]를 눌러주세요.";
+            MessageBoxW(g_hMainWnd, summary.c_str(), L"커스텀 PE 가져오기 완료 (권한 안내)",
+                        MB_ICONWARNING | MB_OK);
+            return;
+        }
+
+        AppendLog(L"선택한 옵션에 따라 커스텀 PE WIM에 [기존 드라이브 문자(C: 등) 자동 복구 패치]를 적용합니다...");
+        SetTaskBusyState(true, L"C: 자동복구 패치중...");
+        std::wstring appDirCopy  = g_appDir;
+        std::wstring wimPathCopy = finalWimPath;
+
+        std::thread([appDirCopy, wimPathCopy, summary, warnSb]() {
+            auto* payload = new AsyncWimTaskResult();
+            payload->kind           = AsyncWimTaskKind::CustomImportDriveFixPatch;
+            payload->wimPath        = wimPathCopy;
+            payload->followUp       = PostPatchFollowUp::None;
+            payload->customSummary  = summary;
+            payload->warnSecureBoot = warnSb;
+            payload->success        = net_sync::PatchBootWimUnattended(
+                appDirCopy, wimPathCopy,
+                [](const std::wstring& m) { PostLogFromWorkerThread(m); },
+                payload->newSig);
+            if (!PostMessageW(g_hMainWnd, WM_APP_TASK_DONE, 0, reinterpret_cast<LPARAM>(payload))) {
+                delete payload;
+            }
+        }).detach();
+        return;
+    }
+
+    if (warnSb) {
         MessageBoxW(g_hMainWnd, summary.c_str(), L"커스텀 PE 가져오기 완료 (Secure Boot 안내 포함)",
                     MB_ICONWARNING | MB_OK);
     } else {
-        summary += L"\n이제 하단의 [▶ 저장 후 지금 PE 재부팅] 또는 [1회성 예약만] 버튼을 누르면 바로 부팅됩니다.";
         MessageBoxW(g_hMainWnd, summary.c_str(), L"커스텀 PE 가져오기 완료",
                     MB_ICONINFORMATION | MB_OK);
     }
@@ -2112,16 +2279,21 @@ void ImportCustomPeFromPath(const std::wstring& selectedPath) {
 
 void ActionImportCustomPe() {
     if (g_isTaskBusy) return;
-    int kind = ShowImportSourceKindDialog();
+    bool patchFix = g_cfg.importPatchDriveFix;
+    int kind = ShowImportSourceKindDialog(patchFix);
+    if (kind == 1 || kind == 2) {
+        g_cfg.importPatchDriveFix = patchFix;
+        SaveConfigToIni(false);
+    }
     if (kind == 1) {
         std::wstring filePath;
         if (BrowseForCustomPeFile(filePath)) {
-            ImportCustomPeFromPath(filePath);
+            ImportCustomPeFromPath(filePath, patchFix ? 1 : 0);
         }
     } else if (kind == 2) {
         std::wstring folderPath;
         if (BrowseForCustomPeFolder(folderPath)) {
-            ImportCustomPeFromPath(folderPath);
+            ImportCustomPeFromPath(folderPath, patchFix ? 1 : 0);
         }
     }
 }
@@ -2634,17 +2806,20 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
             sbNote = L"\n⚠ 참고: 현재 Secure Boot가 켜져 있고 구형 PE(Build " + std::to_wstring(wi.osBuild) +
                      L")가 선택되어 있습니다. 부팅이 차단될 경우 Win11 PE를 쓰거나 BIOS에서 Secure Boot를 꺼주세요.\n";
         }
-        wchar_t confirmMsg[1024];
+        bool wimPatched = IsWimCurrentlyPatched(wimInfo);
+        wchar_t confirmMsg[1280];
         swprintf_s(confirmMsg,
                    L"설정을 저장하고 다음 1회 재부팅을 WinPE로 예약한 뒤 %d초 후 재부팅합니다.\n\n"
                    L"• WIM: %s\n"
                    L"• 로더: %s\n"
+                   L"• 드라이브(C:) 자동 복구: %s\n"
                    L"• 네트워크 무인 적용: %s\n%s\n"
                    L"PE에서 작업 완료 후 재부팅하면 자동으로 기존 Windows로 복귀합니다.\n"
                    L"지금 재부팅하시겠습니까?",
                    g_cfg.rebootDelaySec,
                    wimInfo.fullPath.c_str(),
                    g_cfg.loaderPath.c_str(),
+                   wimPatched ? L"활성화됨 (패치 적용됨)" : L"미적용",
                    g_cfg.autoApplyNetwork ? L"활성화됨 (드라이버 및 IP/DNS/Wi-Fi 동기화)" : L"비활성",
                    sbNote.c_str());
         if (MessageBoxW(g_hMainWnd, confirmMsg, L"1회성 WinPE 부팅 실행 확인",
@@ -2663,6 +2838,8 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
         bool useCacheExport = !wimParentDir.empty() &&
                               (ToLower(wimParentDir).find(L"onetimepe_cache") != std::wstring::npos);
         ActionSyncWindowsNetworkNow(false, useCacheExport ? wimParentDir : L"");
+    } else {
+        SyncDriveMapAndBridgeForPe(wimInfo.fullPath);
     }
 
     // Suspend BitLocker BEFORE modifying BCD so protectors/PCR state and Clear Key are cleanly prepared
@@ -3025,7 +3202,7 @@ void CreateAllControls(HWND hWnd) {
                                0, 0, 10, 10, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
     };
 
-    g_hLblTitle   = mkStatic(L"OneTimePE v1.2 - 1회성 내장 WinPE & 커스텀PE 매니저", SS_LEFT, IDC_LBL_TITLE);
+    g_hLblTitle   = mkStatic(L"OneTimePE v1.3 - 1회성 내장 WinPE & 커스텀PE 매니저", SS_LEFT, IDC_LBL_TITLE);
     g_hLblSysInfo = mkStatic(L"", SS_RIGHT, IDC_LBL_SYSINFO);
 
     // Group 1
@@ -3075,13 +3252,13 @@ void CreateAllControls(HWND hWnd) {
     g_hLblExtra      = mkStatic(L"추가 변수:", SS_LEFT);
     g_hEdtExtra      = mkEdit(IDC_EDT_EXTRA_SET);
 
-    // Group 3: Network Auto-Apply & Unattended WIM Patch
-    g_hGrpNet        = mkGroup(L"3. PE 부팅 후 무인 네트워크 자동 연결 (현재 Windows 네트워크 읽기 + boot.wim 패치)");
+    // Group 3: Drive Letter (C:) Auto-Fix & Unattended Network WIM Patch
+    g_hGrpNet        = mkGroup(L"3. PE 부팅 후 드라이브 문자(C:) 자동 복구 & 무인 네트워크 연결 (WIM 패치)");
     g_hLblNetStatus  = mkStatic(L"", SS_LEFT | SS_ENDELLIPSIS, IDC_LBL_NETSTATUS);
     g_hChkAutoNet    = mkCheck(L"PE 부팅 시 현재 네트워크 자동 적용", IDC_CHK_AUTONET);
     g_hChkExportDrv  = mkCheck(L"랜카드 드라이버(.inf) 함께 추출", IDC_CHK_EXPORT_DRV);
     g_hBtnSyncNet    = mkBtn(L"네트워크 확인/추출", IDC_BTN_SYNC_NET);
-    g_hBtnPatchWim   = mkBtn(L"WIM 무인패치 적용", IDC_BTN_PATCH_WIM);
+    g_hBtnPatchWim   = mkBtn(L"WIM 자동복구 패치", IDC_BTN_PATCH_WIM);
 
     // Group 4: BCD Status & Actions
     g_hGrpActions    = mkGroup(L"4. BCD 상태 및 1회성 부팅 실행");
@@ -3145,7 +3322,7 @@ void HandleDroppedFiles(HDROP hDrop) {
     DragFinish(hDrop);
     if (!customImportTarget.empty()) {
         AppendLog(L"드래그 앤 드롭으로 커스텀 PE 미디어 감지됨: " + customImportTarget);
-        ImportCustomPeFromPath(customImportTarget);
+        ImportCustomPeFromPath(customImportTarget, -1);
     } else {
         UpdateFileStatusBanner();
     }
@@ -3192,10 +3369,14 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             auto* payload = reinterpret_cast<AsyncWimTaskResult*>(lParam);
             SetTaskBusyState(false);
             if (payload) {
-                AsyncWimTaskKind kind = payload->kind;
-                bool ok               = payload->success;
-                PostPatchFollowUp next = payload->followUp;
-                if (ok && kind == AsyncWimTaskKind::UnattendedNetPatch) {
+                AsyncWimTaskKind  kind          = payload->kind;
+                bool              ok            = payload->success;
+                PostPatchFollowUp next          = payload->followUp;
+                std::wstring      customSummary = payload->customSummary;
+                bool              warnSb        = payload->warnSecureBoot;
+
+                if (ok && (kind == AsyncWimTaskKind::UnattendedNetPatch ||
+                           kind == AsyncWimTaskKind::CustomImportDriveFixPatch)) {
                     g_cfg.patchedWimPath = payload->wimPath;
                     g_cfg.patchedWimSig  = payload->newSig;
                     SaveConfigToIni(false);
@@ -3212,6 +3393,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         } else if (next == PostPatchFollowUp::ContinueApplyBcdOnly) {
                             ResolvedFileInfo w{}, s{};
                             if (RegisterOrUpdateBcdEntries(w, s)) {
+                                SyncDriveMapAndBridgeForPe(w.fullPath);
                                 MessageBoxW(hWnd,
                                             (L"ESD → 표준 WIM 변환 및 시스템 BCD 등록이 완료되었습니다.\n\nPE GUID: " + g_cfg.peGuid).c_str(),
                                             L"변환 및 BCD 등록 완료", MB_ICONINFORMATION | MB_OK);
@@ -3221,6 +3403,12 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                         L"ESD(LZMS) 이미지를 RAMDisk 부팅 표준 WIM 포맷으로 변환 완료했습니다!",
                                         L"WIM 포맷 변환 완료", MB_ICONINFORMATION | MB_OK);
                         }
+                    } else if (kind == AsyncWimTaskKind::CustomImportDriveFixPatch) {
+                        MessageBoxW(hWnd,
+                                    customSummary.c_str(),
+                                    warnSb ? L"커스텀 PE 가져오기 및 C: 자동복구 패치 완료 (Secure Boot 안내)"
+                                           : L"커스텀 PE 가져오기 및 C: 자동복구 패치 완료",
+                                    (warnSb ? MB_ICONWARNING : MB_ICONINFORMATION) | MB_OK);
                     } else {
                         if (next == PostPatchFollowUp::ContinueBootNow) {
                             ActionQueueOneTimeBoot(true, true);
@@ -3228,17 +3416,28 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                             ActionQueueOneTimeBoot(false, true);
                         } else {
                             MessageBoxW(hWnd,
-                                        L"선택한 WIM 파일에 무인 네트워크 자동 실행 패치 및 부트 로더 보정이 완료되었습니다!\n\n"
-                                        L"이제 PE로 부팅하면 자동으로 랜카드 드라이버 적재 및 IP/DNS/Wi-Fi 설정이 적용됩니다.",
-                                        L"WIM 무인 패치 완료", MB_ICONINFORMATION | MB_OK);
+                                        L"선택한 WIM 파일에 [기존 드라이브 문자(C: 등) 자동 복구 + 무인 부팅 패치] 및 로더 보정이 완료되었습니다!\n\n"
+                                        L"• PE 부팅 시 숨김/오프라인 속성을 해제하고 원래 Windows 파티션을 C: 로 자동 고정합니다.\n"
+                                        L"• 'PE 부팅 시 현재 네트워크 자동 적용' 체크 시 랜카드 드라이버·IP·Wi-Fi도 함께 동기화됩니다.",
+                                        L"WIM 자동 복구 & 무인 패치 완료", MB_ICONINFORMATION | MB_OK);
                         }
                     }
                 } else {
-                    MessageBoxW(hWnd,
-                                (kind == AsyncWimTaskKind::ConvertEsdToWim)
-                                    ? L"ESD → 표준 WIM 변환 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요."
-                                    : L"WIM 무인 패치 작업 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요.",
-                                L"WIM 작업 실패", MB_ICONERROR | MB_OK);
+                    if (kind == AsyncWimTaskKind::ConvertEsdToWim) {
+                        MessageBoxW(hWnd,
+                                    L"ESD → 표준 WIM 변환 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요.",
+                                    L"WIM 작업 실패", MB_ICONERROR | MB_OK);
+                    } else if (kind == AsyncWimTaskKind::CustomImportDriveFixPatch) {
+                        MessageBoxW(hWnd,
+                                    L"커스텀 PE 파일 세팅은 완료되었으나, WIM 내부 [C: 드라이브 자동 복구 패치] 적용 중 오류가 발생했습니다.\n"
+                                    L"하단 실행 로그에서 상세 원인을 확인해 주세요.\n\n"
+                                    L"(패치 없이 부팅 자체는 지금 가능하며, 필요 시 [WIM 자동복구 패치] 버튼으로 재시도할 수 있습니다.)",
+                                    L"커스텀 PE 패치 경고", MB_ICONWARNING | MB_OK);
+                    } else {
+                        MessageBoxW(hWnd,
+                                    L"WIM 자동 복구 패치 작업 중 오류가 발생했습니다.\n하단 실행 로그에서 상세 원인을 확인해 주세요.",
+                                    L"WIM 작업 실패", MB_ICONERROR | MB_OK);
+                    }
                 }
             }
             return 0;
@@ -3405,6 +3604,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     case IDC_BTN_APPLY_BCD: {
                         ResolvedFileInfo w{}, s{};
                         if (RegisterOrUpdateBcdEntries(w, s)) {
+                            SyncDriveMapAndBridgeForPe(w.fullPath);
                             MessageBoxW(hWnd,
                                         (L"시스템 BCD에 WinPE 항목이 등록/갱신되었습니다.\n(멀티부팅 메뉴에는 표시되지 않으며 1회성 부팅 시 사용됩니다.)\n\nPE GUID: " + g_cfg.peGuid).c_str(),
                                         L"BCD 등록 완료", MB_ICONINFORMATION | MB_OK);
@@ -3476,9 +3676,18 @@ void InitPathsAndEnv() {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     InitAppDirOnly();
 
-    // Silent unattended network setup mode inside WinPE
-    if (lpCmdLine && wcsstr(lpCmdLine, L"--pe-apply-net") != nullptr) {
-        return net_sync::RunPeAutoNetMode(g_appDir);
+    // Silent unattended boot-init / C: drive letter fix / network setup modes inside WinPE
+    if (lpCmdLine) {
+        if (wcsstr(lpCmdLine, L"--pe-boot-init") != nullptr) {
+            return net_sync::RunPeBootInitMode(g_appDir);
+        }
+        if (wcsstr(lpCmdLine, L"--pe-fix-drives") != nullptr) {
+            return net_sync::RunPeFixDrivesMode();
+        }
+        if (wcsstr(lpCmdLine, L"--pe-apply-net") != nullptr) {
+            net_sync::RunPeFixDrivesMode();
+            return net_sync::RunPeAutoNetMode(g_appDir);
+        }
     }
 
     g_hInst = hInstance;

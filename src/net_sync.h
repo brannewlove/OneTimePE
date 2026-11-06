@@ -115,6 +115,9 @@ std::wstring DetectPreferredLoaderPathInWim(const std::wstring& wimFullPath,
                                             bool isUefi,
                                             const std::wstring& currentLoaderPath);
 
+// Fast probe via wimgapi.dll to check if OneTimePE unattended helper (C: drive fix + boot hook) is already inside WIM
+bool IsWimUnattendedPatched(const std::wstring& wimFullPath, uint32_t imageIndex = 1);
+
 // Mount an ISO image read-only (dynamically via virtdisk.dll with PowerShell fallback)
 bool MountIsoReadOnly(const std::wstring& isoFullPath,
                       IsoMountSession& outSession,
@@ -129,6 +132,11 @@ CustomPeDiscoveryResult AnalyzeCustomPeMedia(const std::wstring& selectedPath,
                                              bool preferUefi,
                                              const LogCallback& logCb);
 
+// Snapshot current internal Windows drive letters (C:, D:, ...) + Volume GUIDs & update bridge before PE reboot
+bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
+                         bool autoApplyNetwork,
+                         const LogCallback& logCb);
+
 // Export current Windows network settings, Wi-Fi XML, NIC drivers, and bridge pointer
 bool ExportNetworkConfigForPe(const std::wstring& appDir,
                               const std::wstring& appBcdRelDir,
@@ -136,11 +144,17 @@ bool ExportNetworkConfigForPe(const std::wstring& appDir,
                               const LogCallback& logCb,
                               std::wstring& outSummaryReport);
 
-// Mount boot.wim via DISM, inject unattended auto-network bootstrap hooks, and commit
+// Mount boot.wim via DISM, inject C: drive auto-restore + unattended auto-network helper & hooks, and commit
 bool PatchBootWimUnattended(const std::wstring& appDir,
                             const std::wstring& wimFullPath,
                             const LogCallback& logCb,
                             std::wstring& outNewWimSig);
+
+// Executed silently inside WinPE to unlock hidden/offline attributes and restore C: (and fixed drives)
+int RunPeFixDrivesMode();
+
+// Executed silently inside WinPE at startup ("--pe-boot-init"): fixes C: drive map first, then applies network if enabled
+int RunPeBootInitMode(const std::wstring& appDir);
 
 // Executed silently inside WinPE when launched with "--pe-apply-net"
 int RunPeAutoNetMode(const std::wstring& appDir);

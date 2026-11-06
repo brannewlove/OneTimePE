@@ -62,3 +62,4 @@
 #define IDC_DLG_PE_LIST         1503
 #define IDC_DLG_BTN_OK          1504
 #define IDC_DLG_BTN_CANCEL      1505
+#define IDC_DLG_CHK_FIX_DRV     1506

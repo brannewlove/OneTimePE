@@ -10,7 +10,7 @@
 * **타겟 아키텍처**: **Windows x64 (`amd64` / `x86_64`) 전용**
   * [`src/app.manifest`](src/app.manifest)에 `processorArchitecture="amd64"` 및 관리자 권한(`requireAdministrator`)이 선언되어 있습니다.
 * **정적 링크(`-static`) 필수**:
-  * 빌드된 `OneTimePE.exe`는 일반 Windows 환경의 GUI 매니저 역할뿐만 아니라, **최소한의 시스템 DLL만 존재하는 WinPE 부팅 환경 내부**에서도 무인 네트워크 설정 엔진(`OneTimePE.exe --pe-apply-net`)으로 직접 실행됩니다.
+  * 빌드된 `OneTimePE.exe`는 일반 Windows 환경의 GUI 매니저 역할뿐만 아니라, **최소한의 시스템 DLL만 존재하는 WinPE 부팅 환경 내부(`X:\Windows\System32\OneTimePE_Helper.exe`)** 에서도 기존 `C:` 드라이브 문자 자동 복구 및 무인 네트워크 설정 엔진(`--pe-boot-init`, `--pe-fix-drives`, `--pe-apply-net`)으로 직접 실행됩니다.
   * 따라서 런타임 DLL(`libstdc++-6.dll`, `libwinpthread-1.dll`, `vcruntime140.dll` 등)이 필요 없도록 반드시 **단일 정적 바이너리**로 빌드해야 합니다.
 
 ---

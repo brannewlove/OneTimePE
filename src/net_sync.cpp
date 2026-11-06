@@ -1031,6 +1031,68 @@ std::wstring DetectPreferredLoaderPathInWim(const std::wstring& wimFullPath,
     return detected;
 }
 
+bool IsWimUnattendedPatched(const std::wstring& wimFullPath, uint32_t imageIndex) {
+    if (wimFullPath.empty()) return false;
+    std::wstring sig = ComputeFileSignature(wimFullPath);
+    if (sig.empty()) return false;
+
+    static std::map<std::wstring, std::pair<std::wstring, bool>> s_patchCache;
+    std::wstring key = ToLower(wimFullPath);
+    auto it = s_patchCache.find(key);
+    if (it != s_patchCache.end() && it->second.first == sig) {
+        return it->second.second;
+    }
+
+    if (imageIndex == 0) {
+        WimInspectionInfo wi = InspectWimFile(wimFullPath);
+        imageIndex = (wi.bootIndex > 0) ? wi.bootIndex : 1u;
+    }
+
+    bool patched = false;
+    HMODULE hWimDll = LoadLibraryW(L"wimgapi.dll");
+    if (hWimDll) {
+        using FnWIMCreateFile       = HANDLE(WINAPI*)(PCWSTR, DWORD, DWORD, DWORD, DWORD, PDWORD);
+        using FnWIMSetTempPath      = BOOL(WINAPI*)(HANDLE, PCWSTR);
+        using FnWIMLoadImage        = HANDLE(WINAPI*)(HANDLE, DWORD);
+        using FnWIMExtractImagePath = BOOL(WINAPI*)(HANDLE, PCWSTR, PCWSTR, DWORD);
+        using FnWIMCloseHandle      = BOOL(WINAPI*)(HANDLE);
+
+        auto pCreate  = reinterpret_cast<FnWIMCreateFile>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCreateFile")));
+        auto pSetTemp = reinterpret_cast<FnWIMSetTempPath>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMSetTemporaryPath")));
+        auto pLoad    = reinterpret_cast<FnWIMLoadImage>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMLoadImage")));
+        auto pExtract = reinterpret_cast<FnWIMExtractImagePath>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMExtractImagePath")));
+        auto pClose   = reinterpret_cast<FnWIMCloseHandle>(reinterpret_cast<void*>(GetProcAddress(hWimDll, "WIMCloseHandle")));
+
+        if (pCreate && pLoad && pExtract && pClose) {
+            DWORD cr = 0;
+            HANDLE hWim = pCreate(wimFullPath.c_str(), GENERIC_READ, OPEN_EXISTING, 0, 0, &cr);
+            if (hWim && hWim != INVALID_HANDLE_VALUE) {
+                wchar_t tmpDir[MAX_PATH]{};
+                if (GetTempPathW(MAX_PATH, tmpDir) > 0) {
+                    if (pSetTemp) pSetTemp(hWim, tmpDir);
+                    HANDLE hImg = pLoad(hWim, imageIndex);
+                    if (hImg && hImg != INVALID_HANDLE_VALUE) {
+                        std::wstring probeDst = JoinPath(tmpDir, L"otpe_patch_probe.tmp");
+                        DeleteFileW(probeDst.c_str());
+                        BOOL ok = pExtract(hImg, L"\\Windows\\System32\\OneTimePE_WimPatch.ini", probeDst.c_str(), 0);
+                        if (!ok) {
+                            ok = pExtract(hImg, L"Windows\\System32\\OneTimePE_WimPatch.ini", probeDst.c_str(), 0);
+                        }
+                        patched = ok && (GetFileAttributesW(probeDst.c_str()) != INVALID_FILE_ATTRIBUTES);
+                        DeleteFileW(probeDst.c_str());
+                        pClose(hImg);
+                    }
+                }
+                pClose(hWim);
+            }
+        }
+        FreeLibrary(hWimDll);
+    }
+
+    s_patchCache[key] = { sig, patched };
+    return patched;
+}
+
 namespace {
 
 bool EndsWithLower(const std::wstring& str, const std::wstring& suffixLower) {
@@ -2328,33 +2390,336 @@ bool ExportNetworkConfigForPe(const std::wstring& appDir,
         "endlocal\r\n";
     WriteAsciiFile(JoinPath(netDir, L"ApplyPENetwork.cmd"), fallbackCmd);
 
-    // 5. Write UTF-16LE Unicode bridge & copy self to %SystemRoot%\Temp\OneTimePE_Runner.exe
-    //    Guarantees 100% path resolution in English/Korean WinPE even with Korean/spaces in folder names!
-    wchar_t winDir[MAX_PATH]{};
-    if (GetWindowsDirectoryW(winDir, MAX_PATH) > 0 && !appBcdRelDir.empty()) {
-        std::wstring tempDir = JoinPath(winDir, L"Temp");
-        EnsureDirectoryRecursive(tempDir);
-
-        std::wstring bridgeIni = JoinPath(tempDir, L"OneTimePE_Bridge.ini");
-        DeleteFileW(bridgeIni.c_str());
-        EnsureUnicodeIni(bridgeIni);
-        WritePrivateProfileStringW(L"Bridge", L"RelAppDir", appBcdRelDir.c_str(), bridgeIni.c_str());
-
-        wchar_t selfExe[MAX_PATH * 4]{};
-        if (GetModuleFileNameW(nullptr, selfExe, _countof(selfExe)) > 0) {
-            std::wstring runnerDst = JoinPath(tempDir, L"OneTimePE_Runner.exe");
-            CopyFileW(selfExe, runnerDst.c_str(), FALSE);
-        }
-
-        std::wstring bridgeCmd = JoinPath(tempDir, L"OneTimePE_NetBridge.cmd");
-        std::string relOem = WideToOemOrAcp(appBcdRelDir, GetOEMCP());
-        WriteAsciiFile(bridgeCmd, "@set \"OTPE_REL=" + relOem + "\"\r\n");
-
-        if (logCb) logCb(L"무인 부팅 유니코드 브리지 갱신 완료 -> " + appBcdRelDir);
-    }
+    // 5. Snapshot Windows drive map + write UTF-16LE Unicode bridge & copy self to %SystemRoot%\Temp
+    ExportDriveMapForPe(appBcdRelDir, true, logCb);
 
     outSummaryReport += L"\n저장 폴더: " + netDir;
     if (logCb) logCb(L"네트워크 설정 및 드라이버 추출이 완료되었습니다.");
+    return true;
+}
+
+namespace {
+
+#ifndef IOCTL_MOUNTMGR_SET_AUTO_MOUNT
+#define IOCTL_MOUNTMGR_SET_AUTO_MOUNT CTL_CODE(0x0000006D, 15, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#endif
+
+#ifndef IOCTL_DISK_GET_DISK_ATTRIBUTES
+#define IOCTL_DISK_GET_DISK_ATTRIBUTES CTL_CODE(IOCTL_DISK_BASE, 0x003c, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef IOCTL_DISK_SET_DISK_ATTRIBUTES
+#define IOCTL_DISK_SET_DISK_ATTRIBUTES CTL_CODE(IOCTL_DISK_BASE, 0x003d, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS)
+#endif
+
+#ifndef IOCTL_VOLUME_SET_GPT_ATTRIBUTES
+#define IOCTL_VOLUME_SET_GPT_ATTRIBUTES CTL_CODE(IOCTL_VOLUME_BASE, 13, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef IOCTL_VOLUME_GET_GPT_ATTRIBUTES
+#define IOCTL_VOLUME_GET_GPT_ATTRIBUTES CTL_CODE(IOCTL_VOLUME_BASE, 14, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+#ifndef GPT_BASIC_DATA_ATTRIBUTE_READ_ONLY
+#define GPT_BASIC_DATA_ATTRIBUTE_READ_ONLY 0x1000000000000000ULL
+#endif
+#ifndef GPT_BASIC_DATA_ATTRIBUTE_HIDDEN
+#define GPT_BASIC_DATA_ATTRIBUTE_HIDDEN 0x4000000000000000ULL
+#endif
+#ifndef GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER
+#define GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER 0x8000000000000000ULL
+#endif
+
+struct OtpeGetDiskAttrs {
+    DWORD     version;
+    DWORD     reserved1;
+    ULONGLONG attributes;
+};
+static_assert(sizeof(OtpeGetDiskAttrs) == 16, "OtpeGetDiskAttrs ABI size mismatch");
+
+struct OtpeSetDiskAttrs {
+    DWORD     version;
+    BOOLEAN   persist;
+    BYTE      reserved1[3];
+    ULONGLONG attributes;
+    ULONGLONG attributesMask;
+    DWORD     reserved2[4];
+};
+static_assert(sizeof(OtpeSetDiskAttrs) == 40, "OtpeSetDiskAttrs ABI size mismatch");
+
+struct OtpeVolGetGptAttrs {
+    ULONGLONG gptAttributes;
+};
+static_assert(sizeof(OtpeVolGetGptAttrs) == 8, "OtpeVolGetGptAttrs ABI size mismatch");
+
+struct OtpeVolSetGptAttrs {
+    ULONGLONG gptAttributes;
+    BOOLEAN   revertOnClose;
+    BOOLEAN   applyToAllConnectedVolumes;
+    USHORT    reserved1;
+    ULONG     reserved2;
+};
+static_assert(sizeof(OtpeVolSetGptAttrs) == 16, "OtpeVolSetGptAttrs ABI size mismatch");
+
+constexpr GUID kGptTypeBasicData = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
+constexpr GUID kGptTypeEsp       = { 0xc12a7328, 0xf81f, 0x11d2, { 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b } };
+constexpr GUID kGptTypeMsr       = { 0xe3c9e316, 0x0b5c, 0x4db8, { 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15, 0xae } };
+constexpr GUID kGptTypeWinRe     = { 0xde94bba4, 0x06d1, 0x4d40, { 0xa1, 0x6a, 0xbf, 0xd5, 0x01, 0x79, 0xd6, 0xac } };
+
+bool GuidEq(const GUID& a, const GUID& b) {
+    return std::memcmp(&a, &b, sizeof(GUID)) == 0;
+}
+
+STORAGE_BUS_TYPE QueryDeviceBusType(const std::wstring& devPath) {
+    HANDLE h = CreateFileW(devPath.c_str(), 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return BusTypeUnknown;
+
+    STORAGE_PROPERTY_QUERY q{};
+    q.PropertyId = StorageDeviceProperty;
+    q.QueryType  = PropertyStandardQuery;
+    BYTE buf[1024]{};
+    DWORD ret = 0;
+    STORAGE_BUS_TYPE bt = BusTypeUnknown;
+    if (DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof(q), buf, sizeof(buf), &ret, nullptr) &&
+        ret >= sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buf);
+        bt = desc->BusType;
+    }
+    CloseHandle(h);
+    return bt;
+}
+
+bool IsInternalFixedBus(STORAGE_BUS_TYPE bt) {
+    if (bt == BusTypeUsb || bt == BusTypeSd || bt == BusTypeMmc ||
+        bt == BusTypeVirtual || bt == BusTypeFileBackedVirtual) {
+        return false;
+    }
+    return true;
+}
+
+bool QueryVolumePrimaryExtent(const std::wstring& volNoSlash,
+                              DWORD& outDiskNum,
+                              LONGLONG& outStartOffset,
+                              LONGLONG& outExtentLen) {
+    outDiskNum     = DWORD(-1);
+    outStartOffset = -1;
+    outExtentLen   = 0;
+    HANDLE h = CreateFileW(volNoSlash.c_str(), 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    BYTE extBuf[512]{};
+    DWORD ret = 0;
+    bool ok = false;
+    if (DeviceIoControl(h, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, nullptr, 0,
+                        extBuf, sizeof(extBuf), &ret, nullptr) &&
+        ret >= sizeof(VOLUME_DISK_EXTENTS)) {
+        const auto* vde = reinterpret_cast<const VOLUME_DISK_EXTENTS*>(extBuf);
+        if (vde->NumberOfDiskExtents > 0) {
+            outDiskNum     = vde->Extents[0].DiskNumber;
+            outStartOffset = vde->Extents[0].StartingOffset.QuadPart;
+            outExtentLen   = vde->Extents[0].ExtentLength.QuadPart;
+            ok = true;
+        }
+    }
+    CloseHandle(h);
+    return ok;
+}
+
+// Losslessly prepend a pure-ASCII command line to an INI/script file without re-encoding existing bytes
+// (preserves CP949 Korean / GBK / CP1251 / UTF-8-no-BOM / UTF-8-BOM / UTF-16LE bit-for-bit!)
+bool PrependLinePreservingRawEncoding(const std::wstring& filePath,
+                                      const std::string& asciiLineWithCrlf,
+                                      const std::string& needleLowerAscii,
+                                      bool& outAlreadyPresent) {
+    outAlreadyPresent = false;
+    DWORD attr = GetFileAttributesW(filePath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return false;
+    if (attr & FILE_ATTRIBUTE_READONLY) {
+        SetFileAttributesW(filePath.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+
+    HANDLE hIn = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hIn == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = GetFileSize(hIn, nullptr);
+    if (sz == INVALID_FILE_SIZE) {
+        CloseHandle(hIn);
+        return false;
+    }
+    std::vector<BYTE> raw(sz);
+    DWORD rd = 0;
+    if (sz > 0) ReadFile(hIn, raw.data(), sz, &rd, nullptr);
+    CloseHandle(hIn);
+    raw.resize(rd);
+
+    bool isUtf16Le = (raw.size() >= 2 && raw[0] == 0xFF && raw[1] == 0xFE);
+    bool isUtf8Bom = (!isUtf16Le && raw.size() >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF);
+
+    if (isUtf16Le) {
+        std::wstring text(reinterpret_cast<const wchar_t*>(raw.data() + 2), (raw.size() - 2) / 2);
+        std::wstring wNeedle(needleLowerAscii.begin(), needleLowerAscii.end());
+        if (ToLower(text).find(wNeedle) != std::wstring::npos) {
+            outAlreadyPresent = true;
+            return true;
+        }
+        std::wstring wLine(asciiLineWithCrlf.begin(), asciiLineWithCrlf.end());
+        HANDLE hOut = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hOut == INVALID_HANDLE_VALUE) return false;
+        DWORD wr = 0;
+        const BYTE bom[2] = { 0xFF, 0xFE };
+        WriteFile(hOut, bom, 2, &wr, nullptr);
+        WriteFile(hOut, wLine.data(), static_cast<DWORD>(wLine.size() * sizeof(wchar_t)), &wr, nullptr);
+        if (raw.size() > 2) {
+            WriteFile(hOut, raw.data() + 2, static_cast<DWORD>(raw.size() - 2), &wr, nullptr);
+        }
+        CloseHandle(hOut);
+        return true;
+    }
+
+    std::string lowRaw(raw.size(), '\0');
+    for (size_t i = 0; i < raw.size(); ++i) {
+        unsigned char ch = raw[i];
+        lowRaw[i] = (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch + 32) : static_cast<char>(ch);
+    }
+    if (lowRaw.find(needleLowerAscii) != std::string::npos) {
+        outAlreadyPresent = true;
+        return true;
+    }
+
+    HANDLE hOut = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hOut == INVALID_HANDLE_VALUE) return false;
+    DWORD wr = 0;
+    size_t bodyOffset = 0;
+    if (isUtf8Bom) {
+        const BYTE bom[3] = { 0xEF, 0xBB, 0xBF };
+        WriteFile(hOut, bom, 3, &wr, nullptr);
+        bodyOffset = 3;
+    }
+    WriteFile(hOut, asciiLineWithCrlf.data(), static_cast<DWORD>(asciiLineWithCrlf.size()), &wr, nullptr);
+    if (raw.size() > bodyOffset) {
+        WriteFile(hOut, raw.data() + bodyOffset, static_cast<DWORD>(raw.size() - bodyOffset), &wr, nullptr);
+    }
+    CloseHandle(hOut);
+    return true;
+}
+
+} // namespace
+
+bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
+                         bool autoApplyNetwork,
+                         const LogCallback& logCb) {
+    wchar_t winDir[MAX_PATH]{};
+    if (GetWindowsDirectoryW(winDir, MAX_PATH) == 0) return false;
+
+    wchar_t osLetter = (winDir[0] != L'\0' && winDir[1] == L':')
+                       ? static_cast<wchar_t>(std::towupper(winDir[0]))
+                       : L'C';
+
+    std::wstring tempDir = JoinPath(winDir, L"Temp");
+    EnsureDirectoryRecursive(tempDir);
+
+    // 1. Snapshot all internal fixed drives (OS drive C: first, then D:, E:, ...)
+    struct DriveRecord {
+        wchar_t      letter      = 0;
+        bool         isOs        = false;
+        std::wstring volumeGuid;
+        LONGLONG     startOffset = -1;
+        LONGLONG     extentLen   = 0;
+        DWORD        serial      = 0;
+        std::wstring fsName;
+    };
+    std::vector<DriveRecord> records;
+
+    DWORD mask = GetLogicalDrives();
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int bit = 0; bit < 26; ++bit) {
+            if ((mask & (1u << bit)) == 0) continue;
+            wchar_t ch = static_cast<wchar_t>(L'A' + bit);
+            if (ch == L'X') continue; // Reserved for WinPE RAMDisk
+            bool isOs = (ch == osLetter);
+            if ((pass == 0 && !isOs) || (pass == 1 && isOs)) continue;
+
+            wchar_t rootSlash[4] = { ch, L':', L'\\', L'\0' };
+            std::wstring devColon = std::wstring(L"\\\\.\\") + ch + L":";
+            if (GetDriveTypeW(rootSlash) != DRIVE_FIXED) continue;
+            STORAGE_BUS_TYPE bt = QueryDeviceBusType(devColon);
+            if (!IsInternalFixedBus(bt)) continue;
+
+            wchar_t volGuidBuf[128]{};
+            if (!GetVolumeNameForVolumeMountPointW(rootSlash, volGuidBuf, _countof(volGuidBuf))) {
+                continue;
+            }
+
+            DriveRecord rec;
+            rec.letter     = ch;
+            rec.isOs       = isOs;
+            rec.volumeGuid = ToLower(volGuidBuf);
+
+            DWORD diskNum = DWORD(-1);
+            QueryVolumePrimaryExtent(devColon, diskNum, rec.startOffset, rec.extentLen);
+
+            wchar_t fsBuf[64]{};
+            DWORD serial = 0;
+            if (GetVolumeInformationW(rootSlash, nullptr, 0, &serial, nullptr, nullptr, fsBuf, _countof(fsBuf))) {
+                rec.serial = serial;
+                rec.fsName = fsBuf;
+            }
+            records.push_back(std::move(rec));
+        }
+    }
+
+    // Write pure-ASCII OneTimePE_DriveMap.ini so WinPE can parse it directly via \\?\Volume{GUID}\ before letters exist
+    std::string mapIni = "[DriveMap]\r\n";
+    mapIni += "Count=" + std::to_string(records.size()) + "\r\n";
+    mapIni += std::string("OsLetter=") + static_cast<char>(osLetter) + "\r\n\r\n";
+
+    for (size_t i = 0; i < records.size(); ++i) {
+        const auto& r = records[i];
+        char serialHex[16]{};
+        std::snprintf(serialHex, sizeof(serialHex), "%08lX", static_cast<unsigned long>(r.serial));
+
+        mapIni += "[Drive" + std::to_string(i) + "]\r\n";
+        mapIni += std::string("Letter=") + static_cast<char>(r.letter) + "\r\n";
+        mapIni += std::string("IsOs=") + (r.isOs ? "1" : "0") + "\r\n";
+        mapIni += "VolumeGuid=" + WideToUtf8(r.volumeGuid) + "\r\n";
+        mapIni += "StartOffset=" + std::to_string(r.startOffset) + "\r\n";
+        mapIni += "ExtentLength=" + std::to_string(r.extentLen) + "\r\n";
+        mapIni += std::string("VolumeSerial=") + serialHex + "\r\n";
+        mapIni += "FileSystem=" + WideToUtf8(r.fsName) + "\r\n\r\n";
+    }
+
+    std::wstring driveMapPath = JoinPath(tempDir, L"OneTimePE_DriveMap.ini");
+    WriteAsciiFile(driveMapPath, mapIni);
+
+    // 2. Update OneTimePE_Bridge.ini + OneTimePE_Runner.exe
+    std::wstring bridgeIni = JoinPath(tempDir, L"OneTimePE_Bridge.ini");
+    DeleteFileW(bridgeIni.c_str());
+    EnsureUnicodeIni(bridgeIni);
+    if (!appBcdRelDir.empty()) {
+        WritePrivateProfileStringW(L"Bridge", L"RelAppDir", appBcdRelDir.c_str(), bridgeIni.c_str());
+        std::wstring bridgeCmd = JoinPath(tempDir, L"OneTimePE_NetBridge.cmd");
+        std::string relOem = WideToOemOrAcp(appBcdRelDir, GetOEMCP());
+        WriteAsciiFile(bridgeCmd, "@set \"OTPE_REL=" + relOem + "\"\r\n");
+    }
+    WritePrivateProfileStringW(L"Bridge", L"AutoApplyNet", autoApplyNetwork ? L"1" : L"0", bridgeIni.c_str());
+
+    wchar_t selfExe[MAX_PATH * 4]{};
+    if (GetModuleFileNameW(nullptr, selfExe, _countof(selfExe)) > 0) {
+        CopyFileW(selfExe, JoinPath(tempDir, L"OneTimePE_Runner.exe").c_str(), FALSE);
+    }
+
+    if (logCb) {
+        std::wstring mappedLetters;
+        for (size_t i = 0; i < records.size(); ++i) {
+            if (i > 0) mappedLetters += L", ";
+            mappedLetters += std::wstring(1, records[i].letter) + L":";
+        }
+        logCb(L"PE 부팅용 내장 드라이브 문자 매핑 기록 완료 (" + mappedLetters + L") -> " + driveMapPath);
+    }
     return true;
 }
 
@@ -2390,7 +2755,7 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
     }
 
     // 1. Inspect WIM image indices via DISM (/English for deterministic parsing)
-    if (logCb) logCb(L"--- WIM 무인 네트워크 자동 실행 패치 시작 ---");
+    if (logCb) logCb(L"--- WIM 자동 드라이브 문자(C:) 복구 및 무인 부팅 패치 시작 ---");
     ExecOutput infoRes = RunHiddenProcess(L"dism.exe",
                                           L"/English /Get-WimInfo /WimFile:\"" + wimFullPath + L"\"",
                                           logCb);
@@ -2423,6 +2788,10 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
         }
     }
 
+    wchar_t selfExeBuf[MAX_PATH * 4]{};
+    DWORD selfExeLen = GetModuleFileNameW(nullptr, selfExeBuf, _countof(selfExeBuf));
+    std::wstring selfExePath(selfExeBuf, selfExeLen);
+
     // Clean up any stale mount state before starting
     RunHiddenProcess(L"dism.exe", L"/English /Cleanup-Mountpoints", nullptr);
     if (GetFileAttributesW(mountDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
@@ -2432,68 +2801,29 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
     }
     EnsureDirectoryRecursive(mountDir);
 
-    // Bootstrapper script placed inside X:\Windows\System32\OneTimePE_AutoNet.cmd
-    const std::string autoNetScript =
+    // Self-contained RAMDisk bootstrapper placed inside X:\Windows\System32\OneTimePE_BootInit.cmd
+    // Runs OneTimePE_Helper.exe directly from X:\Windows\System32 even when C: has NO drive letter!
+    const std::string bootInitScript =
         "@echo off\r\n"
         "setlocal\r\n"
-        "if exist \"X:\\Windows\\Temp\\OneTimePE_NetDone.flg\" exit /b 0\r\n"
+        "if exist \"X:\\Windows\\Temp\\OneTimePE_BootInitDone.flg\" exit /b 0\r\n"
         "if not exist \"X:\\Windows\\Temp\" mkdir \"X:\\Windows\\Temp\" >nul 2>&1\r\n"
-        "echo 1 > \"X:\\Windows\\Temp\\OneTimePE_NetDone.flg\"\r\n"
-        "\r\n"
-        "mountvol /e >nul 2>&1\r\n"
-        "set /a OTPE_TRY=0\r\n"
-        "\r\n"
-        ":FIND_LOOP\r\n"
-        "set /a OTPE_TRY+=1\r\n"
-        "\r\n"
-        "for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n"
-        "    if exist \"%%D:\\Windows\\Temp\\OneTimePE_Runner.exe\" (\r\n"
-        "        \"%%D:\\Windows\\Temp\\OneTimePE_Runner.exe\" --pe-apply-net\r\n"
-        "        exit /b 0\r\n"
-        "    )\r\n"
-        ")\r\n"
-        "\r\n"
-        "set \"OTPE_REL=\"\r\n"
-        "set \"OTPE_EXE=\"\r\n"
-        "set \"OTPE_CMD=\"\r\n"
-        "\r\n"
-        "for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n"
-        "    if exist \"%%D:\\Windows\\Temp\\OneTimePE_NetBridge.cmd\" (\r\n"
-        "        call \"%%D:\\Windows\\Temp\\OneTimePE_NetBridge.cmd\"\r\n"
-        "    )\r\n"
-        ")\r\n"
-        "\r\n"
-        "if defined OTPE_REL (\r\n"
-        "    for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n"
-        "        if exist \"%%D:%OTPE_REL%\\OneTimePE.exe\" set \"OTPE_EXE=%%D:%OTPE_REL%\\OneTimePE.exe\"\r\n"
-        "        if exist \"%%D:%OTPE_REL%\\NetConfig\\ApplyPENetwork.cmd\" set \"OTPE_CMD=%%D:%OTPE_REL%\\NetConfig\\ApplyPENetwork.cmd\"\r\n"
-        "    )\r\n"
-        ")\r\n"
-        "\r\n"
-        "if not defined OTPE_EXE (\r\n"
-        "    for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n"
-        "        if exist \"%%D:\\PEBoot\\OneTimePE.exe\" set \"OTPE_EXE=%%D:\\PEBoot\\OneTimePE.exe\"\r\n"
-        "        if exist \"%%D:\\OneTimePE\\PEBoot\\OneTimePE.exe\" set \"OTPE_EXE=%%D:\\OneTimePE\\PEBoot\\OneTimePE.exe\"\r\n"
-        "        if exist \"%%D:\\WinPE\\OneTimePE.exe\" set \"OTPE_EXE=%%D:\\WinPE\\OneTimePE.exe\"\r\n"
-        "    )\r\n"
-        ")\r\n"
-        "\r\n"
-        "if defined OTPE_EXE (\r\n"
-        "    \"%OTPE_EXE%\" --pe-apply-net\r\n"
+        "if exist \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" (\r\n"
+        "    start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" --pe-boot-init\r\n"
         "    exit /b 0\r\n"
         ")\r\n"
-        "if defined OTPE_CMD (\r\n"
-        "    call \"%OTPE_CMD%\"\r\n"
+        "if exist \"X:\\Windows\\System32\\OneTimePE_Helper.exe\" (\r\n"
+        "    start \"\" /min \"X:\\Windows\\System32\\OneTimePE_Helper.exe\" --pe-boot-init\r\n"
         "    exit /b 0\r\n"
         ")\r\n"
-        "\r\n"
-        "if %OTPE_TRY% LSS 15 (\r\n"
-        "    ping -n 3 127.0.0.1 >nul 2>&1\r\n"
-        "    goto :FIND_LOOP\r\n"
-        ")\r\n"
-        "\r\n"
         "endlocal\r\n"
         "exit /b 0\r\n";
+
+    const std::string patchMetaIni =
+        "[WimPatch]\r\n"
+        "Version=2\r\n"
+        "FixDrives=1\r\n"
+        "AutoNetSupport=1\r\n";
 
     for (int idx : indices) {
         if (logCb) {
@@ -2511,48 +2841,74 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
             return false;
         }
 
-        std::wstring sys32Dir = JoinPath(mountDir, L"Windows\\System32");
+        std::wstring winMountDir = JoinPath(mountDir, L"Windows");
+        std::wstring sys32Dir    = JoinPath(winMountDir, L"System32");
         bool patchOk = true;
 
-        // A. Write OneTimePE_AutoNet.cmd into System32
-        std::wstring autoNetPath = JoinPath(sys32Dir, L"OneTimePE_AutoNet.cmd");
-        if (!WriteAsciiFile(autoNetPath, autoNetScript)) {
-            if (logCb) logCb(L"오류: OneTimePE_AutoNet.cmd 파일 기록 실패");
+        // A. Embed standalone OneTimePE_Helper.exe + OneTimePE_BootInit.cmd + OneTimePE_WimPatch.ini directly in X:\Windows\System32
+        std::wstring helperDst = JoinPath(sys32Dir, L"OneTimePE_Helper.exe");
+        DWORD hAttr = GetFileAttributesW(helperDst.c_str());
+        if (hAttr != INVALID_FILE_ATTRIBUTES && (hAttr & FILE_ATTRIBUTE_READONLY)) {
+            SetFileAttributesW(helperDst.c_str(), hAttr & ~FILE_ATTRIBUTE_READONLY);
+        }
+        if (selfExePath.empty() || !CopyFileW(selfExePath.c_str(), helperDst.c_str(), FALSE)) {
+            if (logCb) logCb(L"오류: OneTimePE_Helper.exe 내장 복사 실패");
             patchOk = false;
         } else if (logCb) {
-            logCb(L" • 주입 완료: \\Windows\\System32\\OneTimePE_AutoNet.cmd");
+            logCb(L" • 주입 완료: \\Windows\\System32\\OneTimePE_Helper.exe (C: 드라이브 자동복구 & 무인 엔진)");
+        }
+
+        if (patchOk) {
+            std::wstring bootInitPath = JoinPath(sys32Dir, L"OneTimePE_BootInit.cmd");
+            std::wstring autoNetPath  = JoinPath(sys32Dir, L"OneTimePE_AutoNet.cmd");
+            std::wstring patchIniPath = JoinPath(sys32Dir, L"OneTimePE_WimPatch.ini");
+            if (!WriteAsciiFile(bootInitPath, bootInitScript) ||
+                !WriteAsciiFile(autoNetPath, bootInitScript) ||
+                !WriteAsciiFile(patchIniPath, patchMetaIni)) {
+                if (logCb) logCb(L"오류: 부팅 초기화 스크립트 기록 실패");
+                patchOk = false;
+            } else if (logCb) {
+                logCb(L" • 주입 완료: \\Windows\\System32\\OneTimePE_BootInit.cmd");
+            }
         }
 
         // B. Hook 1: \Windows\System32\startnet.cmd (Standard WinPE)
         if (patchOk) {
             std::wstring startnetPath = JoinPath(sys32Dir, L"startnet.cmd");
-            std::wstring content;
-            TextEncoding enc = TextEncoding::AsciiOrUtf8NoBom;
-            if (!ReadTextAutoEncoding(startnetPath, content, enc)) {
-                content = L"wpeinit\r\n";
-                enc     = TextEncoding::AsciiOrUtf8NoBom;
-            }
-            if (ToLower(content).find(L"onetimepe_autonet.cmd") == std::wstring::npos) {
-                if (!content.empty() && content.back() != L'\n') content += L"\r\n";
-                content += L"@start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_AutoNet.cmd\"\r\n";
-                WriteTextWithEncoding(startnetPath, content, enc);
-                if (logCb) logCb(L" • 후킹 완료: \\Windows\\System32\\startnet.cmd");
-            } else if (logCb) {
-                logCb(L" • 확인됨: startnet.cmd에 이미 자동 실행 훅이 존재함");
+            if (GetFileAttributesW(startnetPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                WriteAsciiFile(startnetPath,
+                               "wpeinit\r\n@start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_BootInit.cmd\"\r\n");
+                if (logCb) logCb(L" • 생성 및 후킹 완료: \\Windows\\System32\\startnet.cmd");
+            } else {
+                std::wstring content;
+                TextEncoding enc = TextEncoding::AsciiOrUtf8NoBom;
+                if (ReadTextAutoEncoding(startnetPath, content, enc)) {
+                    std::wstring low = ToLower(content);
+                    if (low.find(L"onetimepe_bootinit.cmd") == std::wstring::npos &&
+                        low.find(L"onetimepe_autonet.cmd") == std::wstring::npos) {
+                        if (!content.empty() && content.back() != L'\n') content += L"\r\n";
+                        content += L"@start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_BootInit.cmd\"\r\n";
+                        WriteTextWithEncoding(startnetPath, content, enc);
+                        if (logCb) logCb(L" • 후킹 완료: \\Windows\\System32\\startnet.cmd");
+                    } else if (logCb) {
+                        logCb(L" • 확인됨: startnet.cmd에 이미 부팅 훅이 존재함");
+                    }
+                }
             }
         }
 
-        // C. Hook 2: \Windows\System32\winpeshl.ini (Custom GUI / PECMD PE — ONLY if file already exists!)
+        // C. Hook 2: \Windows\System32\winpeshl.ini (Custom GUI PE — ONLY if file already exists!)
         std::wstring winpeshlPath = JoinPath(sys32Dir, L"winpeshl.ini");
         if (patchOk && GetFileAttributesW(winpeshlPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
             std::wstring iniContent;
             TextEncoding enc = TextEncoding::AsciiOrUtf8NoBom;
             if (ReadTextAutoEncoding(winpeshlPath, iniContent, enc)) {
-                if (ToLower(iniContent).find(L"onetimepe_autonet.cmd") == std::wstring::npos) {
-                    std::wstring lowIni = ToLower(iniContent);
+                std::wstring lowIni = ToLower(iniContent);
+                if (lowIni.find(L"onetimepe_bootinit.cmd") == std::wstring::npos &&
+                    lowIni.find(L"onetimepe_autonet.cmd") == std::wstring::npos) {
                     size_t secPos = lowIni.find(L"[launchapps]");
                     const std::wstring hookLine =
-                        L"%SYSTEMROOT%\\System32\\cmd.exe, /c start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_AutoNet.cmd\"\r\n";
+                        L"%SYSTEMROOT%\\System32\\cmd.exe, /c start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_BootInit.cmd\"\r\n";
                     if (secPos != std::wstring::npos) {
                         size_t lineEnd = iniContent.find(L'\n', secPos);
                         if (lineEnd == std::wstring::npos) {
@@ -2567,19 +2923,42 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
                     WriteTextWithEncoding(winpeshlPath, iniContent, enc);
                     if (logCb) logCb(L" • 후킹 완료: \\Windows\\System32\\winpeshl.ini ([LaunchApps] 비동기 연결)");
                 } else if (logCb) {
-                    logCb(L" • 확인됨: winpeshl.ini에 이미 자동 실행 훅이 존재함");
+                    logCb(L" • 확인됨: winpeshl.ini에 이미 부팅 훅이 존재함");
                 }
             }
         }
 
-        // D. Hook 3: Explorer Startup folder fallback for custom Explorer-shell PEs
+        // D. Hook 3: PECMD.INI in System32 or Windows (covers Custom PEs launched directly via Setup\CmdLine -> PECMD.EXE!)
+        if (patchOk) {
+            for (const std::wstring& pecmdCandidate : {
+                     JoinPath(sys32Dir, L"PECMD.INI"),
+                     JoinPath(winMountDir, L"PECMD.INI") }) {
+                if (GetFileAttributesW(pecmdCandidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    bool already = false;
+                    if (PrependLinePreservingRawEncoding(
+                            pecmdCandidate,
+                            "EXEC !%SystemRoot%\\System32\\OneTimePE_BootInit.cmd\r\n",
+                            "onetimepe_bootinit.cmd",
+                            already)) {
+                        std::wstring relDisp = pecmdCandidate.substr(mountDir.size());
+                        if (logCb) {
+                            logCb(already ? (L" • 확인됨: " + relDisp + L"에 이미 PECMD 훅이 존재함")
+                                          : (L" • 후킹 완료: " + relDisp + L" (원본 인코딩 무손실 보존)"));
+                        }
+                    }
+                }
+            }
+        }
+
+        // E. Hook 4: Explorer Startup folder fallback for custom Explorer-shell PEs
         std::wstring startupDir = JoinPath(mountDir, L"Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
         if (patchOk && GetFileAttributesW(startupDir.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            WriteAsciiFile(JoinPath(startupDir, L"OneTimePE_AutoNet.cmd"), autoNetScript);
+            DeleteFileW(JoinPath(startupDir, L"OneTimePE_AutoNet.cmd").c_str());
+            WriteAsciiFile(JoinPath(startupDir, L"OneTimePE_BootInit.cmd"), bootInitScript);
             if (logCb) logCb(L" • 후킹 완료: Default User Startup 시작프로그램 폴더");
         }
 
-        // E. Ensure both System32\winload.{efi,exe} and System32\Boot\winload.{efi,exe} exist when one is present
+        // F. Ensure both System32\winload.{efi,exe} and System32\Boot\winload.{efi,exe} exist when one is present
         //    Prevents 0xc000000f loader path mismatch across custom / recovery WinPE builds!
         if (patchOk) {
             std::wstring bootSubDir = JoinPath(sys32Dir, L"Boot");
@@ -2628,8 +3007,883 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
     }
 
     outNewWimSig = ComputeFileSignature(wimFullPath);
-    if (logCb) logCb(L"★ WIM 무인 네트워크 자동 실행 패치가 완료되었습니다!");
+    // Warm patch cache with new signature
+    IsWimUnattendedPatched(wimFullPath, postCheck.bootIndex > 0 ? postCheck.bootIndex : 1u);
+    if (logCb) logCb(L"★ WIM 드라이브 문자(C:) 자동 복구 및 무인 부팅 패치가 완료되었습니다!");
     return true;
+}
+
+// ============================================================================
+// Silent WinPE Drive-Letter Auto-Recovery Engine (Solves Case B automatically)
+// ============================================================================
+namespace {
+
+struct PePartitionLayoutEntry {
+    DWORD     diskNumber     = DWORD(-1);
+    DWORD     partNumber     = DWORD(-1);
+    LONGLONG  startOffset    = -1;
+    LONGLONG  partLength     = 0;
+    bool      isGpt          = false;
+    GUID      gptType        = {};
+    ULONGLONG gptAttrs       = 0;
+    BYTE      mbrType        = 0;
+    bool      isSystemOrRec  = false;
+};
+
+struct PeVolumeEntry {
+    std::wstring              volumeGuid;    // trailing backslash, lowercase: "\\?\volume{...}\"
+    std::wstring              volNoSlash;    // no trailing backslash
+    DWORD                     diskNumber     = DWORD(-1);
+    DWORD                     partNumber     = DWORD(-1);
+    LONGLONG                  startOffset    = -1;
+    LONGLONG                  extentLen      = 0;
+    DWORD                     serial         = 0;
+    std::wstring              fsName;
+    bool                      isInternal     = true;
+    bool                      isSystemOrRec  = false;
+    bool                      isWindowsOs    = false;
+    bool                      hasDriveMapIni = false;
+    ULONGLONG                 osHiveTime     = 0;
+    std::vector<wchar_t>      mountedLetters;
+};
+
+struct RecordedDriveTarget {
+    wchar_t      letter      = 0;
+    bool         isOs        = false;
+    std::wstring volumeGuid;
+    LONGLONG     startOffset = -1;
+    LONGLONG     extentLen   = 0;
+    DWORD        serial      = 0;
+};
+
+void EnablePeAutoMount(const LogCallback& logCb) {
+    HANDLE hMm = CreateFileW(L"\\\\.\\MountPointManager",
+                             GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hMm != INVALID_HANDLE_VALUE) {
+        BOOL enable = TRUE;
+        DWORD ret = 0;
+        if (DeviceIoControl(hMm, IOCTL_MOUNTMGR_SET_AUTO_MOUNT, &enable, sizeof(enable),
+                            nullptr, 0, &ret, nullptr)) {
+            if (logCb) logCb(L"MountMgr AutoMount enabled via IOCTL.");
+        }
+        CloseHandle(hMm);
+    }
+    RunHiddenProcess(L"mountvol.exe", L"/e", nullptr);
+}
+
+int ClearInternalDisksOfflineAndReadOnly(const LogCallback& logCb) {
+    int internalDiskCount = 0;
+    for (DWORD d = 0; d < 16; ++d) {
+        std::wstring phys = L"\\\\.\\PhysicalDrive" + std::to_wstring(d);
+        STORAGE_BUS_TYPE bt = QueryDeviceBusType(phys);
+        if (bt == BusTypeUnknown) {
+            HANDLE hProbe = CreateFileW(phys.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                        nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hProbe == INVALID_HANDLE_VALUE) continue;
+            CloseHandle(hProbe);
+        }
+        if (!IsInternalFixedBus(bt)) continue;
+        ++internalDiskCount;
+
+        HANDLE hDisk = CreateFileW(phys.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDisk == INVALID_HANDLE_VALUE) continue;
+
+        OtpeGetDiskAttrs gda{};
+        gda.version = sizeof(gda);
+        DWORD ret = 0;
+        if (DeviceIoControl(hDisk, IOCTL_DISK_GET_DISK_ATTRIBUTES, nullptr, 0,
+                            &gda, sizeof(gda), &ret, nullptr)) {
+            const ULONGLONG blockBits = 0x3ULL; // DISK_ATTRIBUTE_OFFLINE (1) | DISK_ATTRIBUTE_READ_ONLY (2)
+            if ((gda.attributes & blockBits) != 0) {
+                OtpeSetDiskAttrs sda{};
+                sda.version        = sizeof(sda);
+                sda.persist        = TRUE;
+                sda.attributes     = 0;
+                sda.attributesMask = blockBits;
+                if (DeviceIoControl(hDisk, IOCTL_DISK_SET_DISK_ATTRIBUTES, &sda, sizeof(sda),
+                                    nullptr, 0, &ret, nullptr)) {
+                    DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, nullptr, 0, nullptr, 0, &ret, nullptr);
+                    if (logCb) {
+                        logCb(L"Cleared Offline/ReadOnly attributes on PhysicalDrive" + std::to_wstring(d));
+                    }
+                }
+            }
+        }
+        CloseHandle(hDisk);
+    }
+    return internalDiskCount;
+}
+
+std::vector<PePartitionLayoutEntry> ScanInternalPartitionLayouts() {
+    std::vector<PePartitionLayoutEntry> out;
+    std::vector<BYTE> buf(32768);
+
+    for (DWORD d = 0; d < 16; ++d) {
+        std::wstring phys = L"\\\\.\\PhysicalDrive" + std::to_wstring(d);
+        STORAGE_BUS_TYPE bt = QueryDeviceBusType(phys);
+        if (!IsInternalFixedBus(bt)) continue;
+
+        HANDLE hDisk = CreateFileW(phys.c_str(), GENERIC_READ,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hDisk == INVALID_HANDLE_VALUE) continue;
+
+        DWORD ret = 0;
+        if (DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_LAYOUT_EX, nullptr, 0,
+                            buf.data(), static_cast<DWORD>(buf.size()), &ret, nullptr) &&
+            ret >= sizeof(DRIVE_LAYOUT_INFORMATION_EX)) {
+            const auto* layout = reinterpret_cast<const DRIVE_LAYOUT_INFORMATION_EX*>(buf.data());
+            DWORD maxParts = std::min<DWORD>(layout->PartitionCount, 128);
+            for (DWORD i = 0; i < maxParts; ++i) {
+                const PARTITION_INFORMATION_EX& pe = layout->PartitionEntry[i];
+                if (pe.PartitionLength.QuadPart <= 0 || pe.PartitionNumber == 0) continue;
+
+                PePartitionLayoutEntry item{};
+                item.diskNumber  = d;
+                item.partNumber  = pe.PartitionNumber;
+                item.startOffset = pe.StartingOffset.QuadPart;
+                item.partLength  = pe.PartitionLength.QuadPart;
+
+                if (pe.PartitionStyle == PARTITION_STYLE_GPT) {
+                    item.isGpt    = true;
+                    item.gptType  = pe.Gpt.PartitionType;
+                    item.gptAttrs = pe.Gpt.Attributes;
+                    // Anything other than Basic Data (ESP, MSR, WinRE, OEM Recovery GUID) is system/recovery!
+                    item.isSystemOrRec = !GuidEq(pe.Gpt.PartitionType, kGptTypeBasicData);
+                } else if (pe.PartitionStyle == PARTITION_STYLE_MBR) {
+                    if (!pe.Mbr.RecognizedPartition || pe.Mbr.PartitionType == 0) continue;
+                    item.mbrType = pe.Mbr.PartitionType;
+                    item.isSystemOrRec = (pe.Mbr.PartitionType == 0xEF ||
+                                          pe.Mbr.PartitionType == 0x27 ||
+                                          pe.Mbr.PartitionType == 0x12 ||
+                                          pe.Mbr.PartitionType == 0xDE ||
+                                          pe.Mbr.PartitionType == 0x84);
+                }
+                out.push_back(item);
+            }
+        }
+        CloseHandle(hDisk);
+    }
+    return out;
+}
+
+bool ClearVolumeBlockingAttributesWin32(const std::wstring& volNoSlash, const LogCallback& logCb) {
+    HANDLE hVol = CreateFileW(volNoSlash.c_str(), GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, 0, nullptr);
+    if (hVol == INVALID_HANDLE_VALUE) return false;
+
+    DWORD ret = 0;
+    DeviceIoControl(hVol, IOCTL_VOLUME_ONLINE, nullptr, 0, nullptr, 0, &ret, nullptr);
+
+    OtpeVolGetGptAttrs cur{};
+    if (DeviceIoControl(hVol, IOCTL_VOLUME_GET_GPT_ATTRIBUTES, nullptr, 0,
+                        &cur, sizeof(cur), &ret, nullptr)) {
+        const ULONGLONG clearMask = GPT_BASIC_DATA_ATTRIBUTE_READ_ONLY |
+                                    GPT_BASIC_DATA_ATTRIBUTE_HIDDEN |
+                                    GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER;
+        if ((cur.gptAttributes & clearMask) != 0) {
+            OtpeVolSetGptAttrs setReq{};
+            setReq.gptAttributes              = (cur.gptAttributes & ~clearMask);
+            setReq.revertOnClose              = FALSE;
+            setReq.applyToAllConnectedVolumes = FALSE;
+            if (DeviceIoControl(hVol, IOCTL_VOLUME_SET_GPT_ATTRIBUTES, &setReq, sizeof(setReq),
+                                nullptr, 0, &ret, nullptr)) {
+                if (logCb) logCb(L"Cleared GPT Hidden/NoDefaultDriveLetter/ReadOnly on " + volNoSlash);
+            }
+            DeviceIoControl(hVol, IOCTL_VOLUME_ONLINE, nullptr, 0, nullptr, 0, &ret, nullptr);
+        }
+    }
+
+    CloseHandle(hVol);
+    return true;
+}
+
+bool ParseAsciiDriveMapIni(const std::wstring& iniPathOnVol,
+                           wchar_t& outOsLetter,
+                           std::vector<RecordedDriveTarget>& outTargets) {
+    HANDLE h = CreateFileW(iniPathOnVol.c_str(), GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = GetFileSize(h, nullptr);
+    if (sz == INVALID_FILE_SIZE || sz == 0 || sz > 65536) {
+        CloseHandle(h);
+        return false;
+    }
+    std::string raw(sz, '\0');
+    DWORD rd = 0;
+    ReadFile(h, raw.data(), sz, &rd, nullptr);
+    CloseHandle(h);
+    raw.resize(rd);
+
+    outOsLetter = L'C';
+    outTargets.clear();
+
+    std::map<std::string, std::map<std::string, std::string>> secs;
+    std::string curSec;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t nl = raw.find('\n', pos);
+        std::string ln = (nl == std::string::npos) ? raw.substr(pos) : raw.substr(pos, nl - pos);
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ' || ln.back() == '\t')) ln.pop_back();
+        size_t st = 0;
+        while (st < ln.size() && (ln[st] == ' ' || ln[st] == '\t')) ++st;
+        ln = ln.substr(st);
+
+        if (ln.size() >= 2 && ln.front() == '[' && ln.back() == ']') {
+            curSec = ln.substr(1, ln.size() - 2);
+        } else if (!ln.empty() && ln.front() != ';') {
+            size_t eq = ln.find('=');
+            if (eq != std::string::npos) {
+                secs[curSec][ln.substr(0, eq)] = ln.substr(eq + 1);
+            }
+        }
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+
+    auto dmIt = secs.find("DriveMap");
+    if (dmIt == secs.end()) return false;
+
+    auto osLtIt = dmIt->second.find("OsLetter");
+    if (osLtIt != dmIt->second.end() && !osLtIt->second.empty()) {
+        char c = osLtIt->second[0];
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
+        if (c >= 'A' && c <= 'Z' && c != 'X') outOsLetter = static_cast<wchar_t>(c);
+    }
+
+    int count = 0;
+    auto cntIt = dmIt->second.find("Count");
+    if (cntIt != dmIt->second.end()) count = std::atoi(cntIt->second.c_str());
+
+    for (int i = 0; i < count && i < 26; ++i) {
+        auto sIt = secs.find("Drive" + std::to_string(i));
+        if (sIt == secs.end()) continue;
+        const auto& kv = sIt->second;
+
+        auto ltIt = kv.find("Letter");
+        if (ltIt == kv.end() || ltIt->second.empty()) continue;
+        char c = ltIt->second[0];
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 32);
+        if (c < 'A' || c > 'Z' || c == 'X') continue;
+
+        RecordedDriveTarget t{};
+        t.letter = static_cast<wchar_t>(c);
+        auto osIt = kv.find("IsOs");
+        t.isOs = (osIt != kv.end() && osIt->second == "1");
+        auto vgIt = kv.find("VolumeGuid");
+        if (vgIt != kv.end()) {
+            t.volumeGuid = ToLower(AnsiToWide(vgIt->second.c_str()));
+            if (!t.volumeGuid.empty() && t.volumeGuid.back() != L'\\') t.volumeGuid += L'\\';
+        }
+        auto soIt = kv.find("StartOffset");
+        if (soIt != kv.end()) t.startOffset = std::atoll(soIt->second.c_str());
+        auto elIt = kv.find("ExtentLength");
+        if (elIt != kv.end()) t.extentLen = std::atoll(elIt->second.c_str());
+        auto srIt = kv.find("VolumeSerial");
+        if (srIt != kv.end()) t.serial = static_cast<DWORD>(std::strtoul(srIt->second.c_str(), nullptr, 16));
+        outTargets.push_back(std::move(t));
+    }
+    return !outTargets.empty();
+}
+
+std::vector<PeVolumeEntry> EnumeratePeVolumes(const std::vector<PePartitionLayoutEntry>& layouts,
+                                              wchar_t& ioOsLetter,
+                                              std::vector<RecordedDriveTarget>& ioRecordedTargets) {
+    std::vector<PeVolumeEntry> vols;
+    wchar_t volBuf[MAX_PATH]{};
+    HANDLE hFind = FindFirstVolumeW(volBuf, _countof(volBuf));
+    if (hFind == INVALID_HANDLE_VALUE) return vols;
+
+    ULONGLONG newestMapTime = 0;
+
+    do {
+        std::wstring vGuid = ToLower(volBuf);
+        if (vGuid.empty()) continue;
+        if (vGuid.back() != L'\\') vGuid += L'\\';
+        std::wstring vNoSlash = vGuid.substr(0, vGuid.size() - 1);
+
+        UINT dt = GetDriveTypeW(vGuid.c_str());
+        if (dt == DRIVE_CDROM || dt == DRIVE_REMOTE) continue;
+
+        PeVolumeEntry ve{};
+        ve.volumeGuid = vGuid;
+        ve.volNoSlash = vNoSlash;
+
+        wchar_t pathsBuf[512]{};
+        DWORD retChars = 0;
+        bool isXRamdisk = false;
+        if (GetVolumePathNamesForVolumeNameW(vGuid.c_str(), pathsBuf, _countof(pathsBuf), &retChars)) {
+            const wchar_t* p = pathsBuf;
+            while (*p != L'\0') {
+                if (std::iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'\0')) {
+                    wchar_t L = static_cast<wchar_t>(std::towupper(p[0]));
+                    if (L == L'X') isXRamdisk = true;
+                    ve.mountedLetters.push_back(L);
+                }
+                p += wcslen(p) + 1;
+            }
+        }
+        if (isXRamdisk) continue;
+
+        STORAGE_BUS_TYPE bt = QueryDeviceBusType(vNoSlash);
+        ve.isInternal = IsInternalFixedBus(bt) && (dt != DRIVE_REMOVABLE);
+
+        QueryVolumePrimaryExtent(vNoSlash, ve.diskNumber, ve.startOffset, ve.extentLen);
+
+        STORAGE_DEVICE_NUMBER sdn{};
+        if (QueryDeviceNumberForHandlePath(vNoSlash, sdn) && sdn.DeviceType == FILE_DEVICE_DISK) {
+            if (ve.diskNumber == DWORD(-1)) ve.diskNumber = sdn.DeviceNumber;
+            ve.partNumber = sdn.PartitionNumber;
+        }
+
+        // Cross-reference partition layout table
+        for (const auto& le : layouts) {
+            if (le.diskNumber == ve.diskNumber && le.startOffset == ve.startOffset) {
+                if (ve.partNumber == DWORD(-1) || ve.partNumber == 0) ve.partNumber = le.partNumber;
+                if (le.isSystemOrRec) ve.isSystemOrRec = true;
+                break;
+            }
+        }
+
+        // Online internal Basic Data volumes so their root directory is readable even without a drive letter
+        if (ve.isInternal && !ve.isSystemOrRec) {
+            HANDLE hVol = CreateFileW(vNoSlash.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                      nullptr, OPEN_EXISTING, 0, nullptr);
+            if (hVol != INVALID_HANDLE_VALUE) {
+                DWORD dummy = 0;
+                DeviceIoControl(hVol, IOCTL_VOLUME_ONLINE, nullptr, 0, nullptr, 0, &dummy, nullptr);
+                CloseHandle(hVol);
+            }
+        }
+
+        wchar_t fsBuf[64]{};
+        DWORD serial = 0;
+        if (GetVolumeInformationW(vGuid.c_str(), nullptr, 0, &serial, nullptr, nullptr, fsBuf, _countof(fsBuf))) {
+            ve.serial = serial;
+            ve.fsName = fsBuf;
+        }
+
+        // Detect disguised WinRE / OEM Recovery partitions (< 25 GB with WinRE/Samsung_Recovery and no explorer.exe)
+        bool hasSysHive  = FileExistsRegular(vGuid + L"Windows\\System32\\config\\SYSTEM");
+        bool hasSoftHive = FileExistsRegular(vGuid + L"Windows\\System32\\config\\SOFTWARE");
+        bool hasExplorer = FileExistsRegular(vGuid + L"Windows\\explorer.exe") ||
+                           FileExistsRegular(vGuid + L"Windows\\System32\\ntoskrnl.exe");
+
+        if (!hasExplorer && ve.extentLen > 0 && ve.extentLen < (25LL * 1024LL * 1024LL * 1024LL)) {
+            if (FileExistsRegular(vGuid + L"Recovery\\WindowsRE\\winre.wim") ||
+                DirExists(vGuid + L"Samsung_Recovery") ||
+                DirExists(vGuid + L"RecoveryImage")) {
+                ve.isSystemOrRec = true;
+            }
+        }
+
+        if (ve.isInternal && !ve.isSystemOrRec && hasSysHive && hasSoftHive && hasExplorer) {
+            ve.isWindowsOs = true;
+            WIN32_FILE_ATTRIBUTE_DATA fad{};
+            if (GetFileAttributesExW((vGuid + L"Windows\\System32\\config\\SYSTEM").c_str(),
+                                     GetFileExInfoStandard, &fad)) {
+                ve.osHiveTime = (static_cast<ULONGLONG>(fad.ftLastWriteTime.dwHighDateTime) << 32) |
+                                fad.ftLastWriteTime.dwLowDateTime;
+            }
+        }
+
+        std::wstring mapIniPath = vGuid + L"Windows\\Temp\\OneTimePE_DriveMap.ini";
+        WIN32_FILE_ATTRIBUTE_DATA mapFad{};
+        if (GetFileAttributesExW(mapIniPath.c_str(), GetFileExInfoStandard, &mapFad) &&
+            !(mapFad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            ve.hasDriveMapIni = true;
+            ULONGLONG mt = (static_cast<ULONGLONG>(mapFad.ftLastWriteTime.dwHighDateTime) << 32) |
+                           mapFad.ftLastWriteTime.dwLowDateTime;
+            if (mt >= newestMapTime) {
+                wchar_t parsedOs = L'C';
+                std::vector<RecordedDriveTarget> parsedTargets;
+                if (ParseAsciiDriveMapIni(mapIniPath, parsedOs, parsedTargets)) {
+                    newestMapTime     = mt;
+                    ioOsLetter        = parsedOs;
+                    ioRecordedTargets = std::move(parsedTargets);
+                }
+            }
+        }
+
+        vols.push_back(std::move(ve));
+    } while (FindNextVolumeW(hFind, volBuf, _countof(volBuf)));
+
+    FindClose(hFind);
+    return vols;
+}
+
+bool RunDiskpartScript(const std::string& scriptContent, const LogCallback& logCb) {
+    EnsureDirectoryRecursive(L"X:\\Windows\\Temp");
+    std::wstring scriptPath = L"X:\\Windows\\Temp\\otpe_diskpart.txt";
+    if (!WriteAsciiFile(scriptPath, scriptContent)) return false;
+    ExecOutput r = RunHiddenProcess(L"diskpart.exe", L"/s \"" + scriptPath + L"\"", logCb);
+    DeleteFileW(scriptPath.c_str());
+    return r.exitCode == 0;
+}
+
+void NotifyShellDriveChanges(const std::vector<wchar_t>& changedLetters) {
+    HMODULE hShell = GetModuleHandleW(L"shell32.dll");
+    if (!hShell) hShell = LoadLibraryW(L"shell32.dll");
+    if (hShell) {
+        using FnSHChangeNotify = void(WINAPI*)(LONG, UINT, LPCVOID, LPCVOID);
+        auto pNotify = reinterpret_cast<FnSHChangeNotify>(
+            reinterpret_cast<void*>(GetProcAddress(hShell, "SHChangeNotify")));
+        if (pNotify) {
+            constexpr LONG kShcneDriveAdd  = 0x00000100L;
+            constexpr LONG kShcneUpdateDir = 0x00001000L;
+            constexpr UINT kShcnfPathW     = 0x0005u;
+            for (wchar_t ch : changedLetters) {
+                wchar_t root[4] = { ch, L':', L'\\', L'\0' };
+                pNotify(kShcneDriveAdd, kShcnfPathW, root, nullptr);
+                pNotify(kShcneUpdateDir, kShcnfPathW, root, nullptr);
+            }
+        }
+    }
+    DWORD_PTR msgRes = 0;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_DEVICECHANGE, 0x0007 /*DBT_DEVNODES_CHANGED*/,
+                        0, SMTO_ABORTIFHUNG, 400, &msgRes);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
+                        reinterpret_cast<LPARAM>(L"Environment"), SMTO_ABORTIFHUNG, 400, &msgRes);
+}
+
+wchar_t PickSafeFallbackLetter(const std::set<wchar_t>& reservedLetters) {
+    // Prefer S..W, R..M — intentionally avoid C..E, X (RAMDisk), and Y (Korean Custom PE PETools/Y.ini)!
+    constexpr wchar_t kCandidates[] = {
+        L'S', L'T', L'U', L'V', L'W', L'R', L'Q', L'P', L'O', L'N', L'M', L'L', L'K', L'Z'
+    };
+    DWORD usedMask = GetLogicalDrives();
+    for (wchar_t c : kCandidates) {
+        if (reservedLetters.count(c) > 0) continue;
+        if ((usedMask & (1u << (c - L'A'))) == 0) return c;
+    }
+    return 0;
+}
+
+bool ApplySingleDriveLetterRestore(const PeVolumeEntry& targetVol,
+                                   wchar_t targetLetter,
+                                   bool verifyWindowsDir,
+                                   const std::vector<PeVolumeEntry>& allVols,
+                                   const std::set<wchar_t>& reservedLetters,
+                                   const LogCallback& logCb) {
+    wchar_t targetRoot[4] = { targetLetter, L':', L'\\', L'\0' };
+
+    auto isProperlyMountedNow = [&]() -> bool {
+        wchar_t curGuid[128]{};
+        if (!GetVolumeNameForVolumeMountPointW(targetRoot, curGuid, _countof(curGuid))) {
+            return false;
+        }
+        std::wstring lowCur = ToLower(curGuid);
+        if (!lowCur.empty() && lowCur.back() != L'\\') lowCur += L'\\';
+        if (lowCur != targetVol.volumeGuid) return false;
+        if (verifyWindowsDir) {
+            std::wstring checkSys = std::wstring(targetRoot) + L"Windows\\System32\\config\\SYSTEM";
+            return GetFileAttributesW(checkSys.c_str()) != INVALID_FILE_ATTRIBUTES;
+        }
+        return GetDriveTypeW(targetRoot) == DRIVE_FIXED;
+    };
+
+    if (isProperlyMountedNow()) {
+        if (logCb) {
+            logCb(std::wstring(L"Drive ") + targetLetter + L": is already mounted to target volume " + targetVol.volumeGuid);
+        }
+        return true;
+    }
+
+    // 1. Check if another volume is currently occupying targetLetter:
+    DWORD occupantDisk = DWORD(-1);
+    DWORD occupantPart = DWORD(-1);
+    std::wstring occupantGuid;
+    bool occupantIsSystemOrRec = false;
+
+    wchar_t occBuf[128]{};
+    if (GetVolumeNameForVolumeMountPointW(targetRoot, occBuf, _countof(occBuf))) {
+        occupantGuid = ToLower(occBuf);
+        if (!occupantGuid.empty() && occupantGuid.back() != L'\\') occupantGuid += L'\\';
+        if (occupantGuid != targetVol.volumeGuid) {
+            for (const auto& v : allVols) {
+                if (v.volumeGuid == occupantGuid) {
+                    occupantDisk          = v.diskNumber;
+                    occupantPart          = v.partNumber;
+                    occupantIsSystemOrRec = v.isSystemOrRec;
+                    break;
+                }
+            }
+            if (logCb) {
+                logCb(std::wstring(L"Evicting non-target volume from ") + targetLetter + L": -> " + occupantGuid);
+            }
+            DeleteVolumeMountPointW(targetRoot);
+            if (!occupantIsSystemOrRec && !occupantGuid.empty()) {
+                wchar_t fallback = PickSafeFallbackLetter(reservedLetters);
+                if (fallback != 0) {
+                    wchar_t fbRoot[4] = { fallback, L':', L'\\', L'\0' };
+                    if (SetVolumeMountPointW(fbRoot, occupantGuid.c_str()) && logCb) {
+                        logCb(std::wstring(L"Reassigned displaced volume to ") + fallback + L":");
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Remove any wrong letter currently attached to targetVol (e.g. if Windows partition got D: or E:)
+    wchar_t curPaths[512]{};
+    DWORD retChars = 0;
+    if (GetVolumePathNamesForVolumeNameW(targetVol.volumeGuid.c_str(), curPaths, _countof(curPaths), &retChars)) {
+        const wchar_t* p = curPaths;
+        while (*p != L'\0') {
+            if (std::iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'\0')) {
+                wchar_t existingL = static_cast<wchar_t>(std::towupper(p[0]));
+                if (existingL != targetLetter && existingL != L'X') {
+                    wchar_t oldRoot[4] = { existingL, L':', L'\\', L'\0' };
+                    DeleteVolumeMountPointW(oldRoot);
+                }
+            }
+            p += wcslen(p) + 1;
+        }
+    }
+
+    // 3. Fast Win32 IOCTL unblock + mount attempt
+    ClearVolumeBlockingAttributesWin32(targetVol.volNoSlash, logCb);
+    SetVolumeMountPointW(targetRoot, targetVol.volumeGuid.c_str());
+
+    if (isProperlyMountedNow()) {
+        if (logCb) {
+            logCb(std::wstring(L"Successfully restored ") + targetLetter + L": via Win32 Volume API -> " + targetVol.volumeGuid);
+        }
+        return true;
+    }
+
+    // 4. Full Case B diskpart script execution (clears VDS/MountMgr hidden/nodefaultdriveletter/readonly/offline & assigns letter)
+    if (targetVol.diskNumber != DWORD(-1) && targetVol.partNumber != DWORD(-1) && targetVol.partNumber > 0) {
+        if (logCb) {
+            logCb(std::wstring(L"Running diskpart Case-B recovery for ") + targetLetter +
+                  L": (Disk " + std::to_wstring(targetVol.diskNumber) +
+                  L", Partition " + std::to_wstring(targetVol.partNumber) + L")...");
+        }
+
+        std::string dp = "automount enable\r\n";
+        if (!occupantGuid.empty() && occupantDisk != DWORD(-1) && occupantPart != DWORD(-1) && occupantPart > 0) {
+            dp += "select disk " + std::to_string(occupantDisk) + "\r\n";
+            dp += "select partition " + std::to_string(occupantPart) + "\r\n";
+            dp += std::string("remove letter=") + static_cast<char>(targetLetter) + " noerr\r\n";
+            if (!occupantIsSystemOrRec) {
+                wchar_t fb = PickSafeFallbackLetter(reservedLetters);
+                if (fb != 0) {
+                    dp += std::string("assign letter=") + static_cast<char>(fb) + " noerr\r\n";
+                }
+            }
+        }
+
+        dp += "select disk " + std::to_string(targetVol.diskNumber) + "\r\n";
+        dp += "online disk noerr\r\n";
+        dp += "attributes disk clear readonly noerr\r\n";
+        dp += "select partition " + std::to_string(targetVol.partNumber) + "\r\n";
+        dp += "online volume noerr\r\n";
+        dp += "attributes volume clear readonly noerr\r\n";
+        dp += "attributes volume clear hidden noerr\r\n";
+        dp += "attributes volume clear nodefaultdriveletter noerr\r\n";
+        dp += std::string("assign letter=") + static_cast<char>(targetLetter) + " noerr\r\n";
+
+        RunDiskpartScript(dp, logCb);
+        SetVolumeMountPointW(targetRoot, targetVol.volumeGuid.c_str());
+    }
+
+    bool finalOk = isProperlyMountedNow();
+    if (logCb) {
+        logCb(finalOk
+              ? (std::wstring(L"Successfully restored ") + targetLetter + L": via diskpart + MountMgr!")
+              : (std::wstring(L"WARNING: Failed to verify ") + targetLetter + L": after recovery attempts."));
+    }
+    return finalOk;
+}
+
+} // namespace
+
+int RunPeFixDrivesMode() {
+    EnsureDirectoryRecursive(L"X:\\Windows\\Temp");
+    std::wstring xLogPath = L"X:\\Windows\\Temp\\OneTimePE_DriveFix.log";
+
+    auto drvLog = [&](const std::wstring& msg) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t ts[40];
+        swprintf_s(ts, L"[%04d-%02d-%02d %02d:%02d:%02d] ",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        std::string u8 = WideToUtf8(std::wstring(ts) + msg + L"\r\n");
+        HANDLE h = CreateFileW(xLogPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD wr = 0;
+            WriteFile(h, u8.data(), static_cast<DWORD>(u8.size()), &wr, nullptr);
+            CloseHandle(h);
+        }
+    };
+
+    drvLog(L"=== OneTimePE WinPE Drive-Letter Auto-Recovery Engine Started ===");
+    EnablePeAutoMount(drvLog);
+
+    wchar_t targetOsLetter = L'C';
+    std::vector<RecordedDriveTarget> recordedTargets;
+    std::vector<PePartitionLayoutEntry> layouts;
+    std::vector<PeVolumeEntry> vols;
+
+    // Wait up to ~12 seconds if internal storage PnP (NVMe/VMD/SATA) is still enumerating at early boot
+    for (int waitStep = 0; waitStep < 12; ++waitStep) {
+        ClearInternalDisksOfflineAndReadOnly(waitStep == 0 ? drvLog : LogCallback{});
+        layouts = ScanInternalPartitionLayouts();
+        vols    = EnumeratePeVolumes(layouts, targetOsLetter, recordedTargets);
+        if (!vols.empty() || !layouts.empty()) {
+            bool anyOsOrMap = false;
+            for (const auto& v : vols) {
+                if (v.isWindowsOs || v.hasDriveMapIni) { anyOsOrMap = true; break; }
+            }
+            if (anyOsOrMap || waitStep >= 4) break;
+        }
+        Sleep(1000);
+    }
+
+    // If NO Windows OS volume was visible yet because GPT HIDDEN (0x4000000000000000) or MBR 0x17 kept NTFS unmounted,
+    // probe hidden Basic Data partitions (>= 12 GB), keeping unhidden ONLY if confirmed to be a real Windows OS partition!
+    bool foundAnyOsVol = false;
+    for (const auto& v : vols) {
+        if (v.isWindowsOs || v.hasDriveMapIni) { foundAnyOsVol = true; break; }
+    }
+    if (!foundAnyOsVol) {
+        for (const auto& le : layouts) {
+            if (le.isSystemOrRec || le.partLength < (12LL * 1024LL * 1024LL * 1024LL)) continue;
+            const ULONGLONG hideBits = GPT_BASIC_DATA_ATTRIBUTE_HIDDEN |
+                                       GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER |
+                                       GPT_BASIC_DATA_ATTRIBUTE_READ_ONLY;
+            bool isHiddenCandidate = (le.isGpt && (le.gptAttrs & hideBits) != 0) ||
+                                     (!le.isGpt && le.mbrType == 0x17);
+            if (!isHiddenCandidate) continue;
+
+            drvLog(L"Probing hidden internal Basic Data partition (Disk " +
+                   std::to_wstring(le.diskNumber) + L", Partition " + std::to_wstring(le.partNumber) + L")...");
+
+            std::string probeDp =
+                "automount enable\r\n"
+                "select disk " + std::to_string(le.diskNumber) + "\r\n"
+                "online disk noerr\r\n"
+                "attributes disk clear readonly noerr\r\n"
+                "select partition " + std::to_string(le.partNumber) + "\r\n";
+            if (!le.isGpt && le.mbrType == 0x17) {
+                probeDp += "set id=07 override noerr\r\n";
+            }
+            probeDp +=
+                "online volume noerr\r\n"
+                "attributes volume clear readonly noerr\r\n"
+                "attributes volume clear hidden noerr\r\n"
+                "attributes volume clear nodefaultdriveletter noerr\r\n";
+            RunDiskpartScript(probeDp, drvLog);
+            Sleep(500);
+
+            vols = EnumeratePeVolumes(layouts, targetOsLetter, recordedTargets);
+            bool confirmedOs = false;
+            for (const auto& v : vols) {
+                if (v.diskNumber == le.diskNumber && v.startOffset == le.startOffset &&
+                    (v.isWindowsOs || v.hasDriveMapIni)) {
+                    confirmedOs   = true;
+                    foundAnyOsVol = true;
+                    break;
+                }
+            }
+            if (confirmedOs) {
+                drvLog(L"Confirmed hidden partition IS the Windows OS volume!");
+                break;
+            } else {
+                // Re-hide OEM recovery partition (e.g. SAMSUNG_REC2) so it remains untouched
+                drvLog(L"Partition is not Windows OS (likely OEM recovery) — restoring hidden attributes.");
+                std::string rehideDp =
+                    "select disk " + std::to_string(le.diskNumber) + "\r\n"
+                    "select partition " + std::to_string(le.partNumber) + "\r\n"
+                    "remove noerr\r\n";
+                if (le.isGpt) {
+                    if (le.gptAttrs & GPT_BASIC_DATA_ATTRIBUTE_NO_DRIVE_LETTER) {
+                        rehideDp += "attributes volume set nodefaultdriveletter noerr\r\n";
+                    }
+                    if (le.gptAttrs & GPT_BASIC_DATA_ATTRIBUTE_HIDDEN) {
+                        rehideDp += "attributes volume set hidden noerr\r\n";
+                    }
+                } else if (le.mbrType == 0x17) {
+                    rehideDp += "set id=17 override noerr\r\n";
+                }
+                RunDiskpartScript(rehideDp, nullptr);
+            }
+        }
+        vols = EnumeratePeVolumes(layouts, targetOsLetter, recordedTargets);
+    }
+
+    // Match helper for recorded targets
+    auto matchRecordedVolume = [&](const RecordedDriveTarget& rt) -> const PeVolumeEntry* {
+        if (!rt.volumeGuid.empty()) {
+            for (const auto& v : vols) {
+                if (v.volumeGuid == rt.volumeGuid) return &v;
+            }
+        }
+        if (rt.startOffset >= 0 && rt.extentLen > 0) {
+            for (const auto& v : vols) {
+                if (v.isInternal && v.startOffset == rt.startOffset && v.extentLen == rt.extentLen) {
+                    return &v;
+                }
+            }
+        }
+        if (rt.serial != 0) {
+            for (const auto& v : vols) {
+                if (v.isInternal && !v.isSystemOrRec && v.serial == rt.serial) return &v;
+            }
+        }
+        return nullptr;
+    };
+
+    // Select Primary OS Volume
+    const PeVolumeEntry* primaryOsVol = nullptr;
+    for (const auto& rt : recordedTargets) {
+        if (rt.isOs) {
+            primaryOsVol   = matchRecordedVolume(rt);
+            targetOsLetter = rt.letter;
+            break;
+        }
+    }
+    if (!primaryOsVol) {
+        ULONGLONG bestScore = 0;
+        for (const auto& v : vols) {
+            if (!v.isWindowsOs && !v.hasDriveMapIni) continue;
+            ULONGLONG score = (v.hasDriveMapIni ? (1ULL << 62) : 0ULL) + (v.osHiveTime >> 4);
+            if (!primaryOsVol || score > bestScore) {
+                primaryOsVol = &v;
+                bestScore    = score;
+            }
+        }
+    }
+
+    if (!primaryOsVol) {
+        drvLog(L"No internal Windows OS NTFS partition found (may be BitLocker locked or raw disk).");
+        return 1;
+    }
+
+    drvLog(L"Target Windows OS Volume selected: " + primaryOsVol->volumeGuid +
+           L" -> Letter " + std::wstring(1, targetOsLetter) + L":");
+
+    std::set<wchar_t> reservedLetters;
+    reservedLetters.insert(targetOsLetter);
+    reservedLetters.insert(L'X');
+    reservedLetters.insert(L'Y'); // Protect Custom PE Y: mount
+    for (const auto& rt : recordedTargets) {
+        reservedLetters.insert(rt.letter);
+    }
+
+    std::vector<wchar_t> changedLetters;
+    bool osOk = ApplySingleDriveLetterRestore(*primaryOsVol, targetOsLetter, primaryOsVol->isWindowsOs,
+                                              vols, reservedLetters, drvLog);
+    if (osOk) changedLetters.push_back(targetOsLetter);
+
+    // Also restore any additional recorded internal fixed drives (D:, E:, ...), respecting Custom PE's Y: if mounted
+    DWORD curDriveMask = GetLogicalDrives();
+    for (const auto& rt : recordedTargets) {
+        if (rt.isOs || rt.letter == targetOsLetter || rt.letter == L'X') continue;
+        if (rt.letter == L'Y' && (curDriveMask & (1u << (L'Y' - L'A'))) != 0) {
+            drvLog(L"Skipping Y: data restore because Custom PE already uses Y: for external tools.");
+            continue;
+        }
+        const PeVolumeEntry* dv = matchRecordedVolume(rt);
+        if (dv && dv->volumeGuid != primaryOsVol->volumeGuid && !dv->isSystemOrRec) {
+            if (ApplySingleDriveLetterRestore(*dv, rt.letter, false, vols, reservedLetters, drvLog)) {
+                changedLetters.push_back(rt.letter);
+            }
+        }
+    }
+
+    if (!changedLetters.empty()) {
+        NotifyShellDriveChanges(changedLetters);
+    }
+
+    // Post-boot 12-second anti-hijack watchdog: if a late PECMD.INI script detaches or steals C:, re-secure it immediately!
+    std::wstring savedOsGuid = primaryOsVol->volumeGuid;
+    PeVolumeEntry savedOsSnapshot = *primaryOsVol;
+    wchar_t osRoot[4] = { targetOsLetter, L':', L'\\', L'\0' };
+
+    for (int watch = 0; watch < 6; ++watch) {
+        Sleep(2000);
+        wchar_t checkGuid[128]{};
+        bool stillMounted = GetVolumeNameForVolumeMountPointW(osRoot, checkGuid, _countof(checkGuid)) != FALSE;
+        std::wstring lowCheck = ToLower(checkGuid);
+        if (!lowCheck.empty() && lowCheck.back() != L'\\') lowCheck += L'\\';
+        if (!stillMounted || lowCheck != savedOsGuid) {
+            drvLog(L"Watchdog detected late PE script altered " + std::wstring(1, targetOsLetter) +
+                   L": — re-applying Windows OS drive letter!");
+            auto freshVols = EnumeratePeVolumes(layouts, targetOsLetter, recordedTargets);
+            const PeVolumeEntry* targetPtr = &savedOsSnapshot;
+            for (const auto& fv : freshVols) {
+                if (fv.volumeGuid == savedOsGuid) { targetPtr = &fv; break; }
+            }
+            if (ApplySingleDriveLetterRestore(*targetPtr, targetOsLetter, targetPtr->isWindowsOs,
+                                              freshVols, reservedLetters, drvLog)) {
+                NotifyShellDriveChanges({ targetOsLetter });
+            }
+        }
+    }
+
+    drvLog(L"=== OneTimePE WinPE Drive-Letter Auto-Recovery Completed ===");
+
+    // Mirror log to C:\Windows\Temp\OneTimePE_DriveFix.log so user can review after rebooting to Windows
+    std::wstring hostTempDir = std::wstring(1, targetOsLetter) + L":\\Windows\\Temp";
+    if (DirExists(hostTempDir)) {
+        CopyFileW(xLogPath.c_str(), JoinPath(hostTempDir, L"OneTimePE_DriveFix.log").c_str(), FALSE);
+    }
+
+    return osOk ? 0 : 1;
+}
+
+int RunPeBootInitMode(const std::wstring& appDir) {
+    // Prevent duplicate concurrent execution across startnet.cmd + winpeshl.ini + PECMD.INI + Startup hooks
+    HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"Local\\OneTimePE_BootInit_Active");
+    if (hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hMutex);
+        return 0;
+    }
+
+    EnsureDirectoryRecursive(L"X:\\Windows\\Temp");
+    std::wstring doneFlag = L"X:\\Windows\\Temp\\OneTimePE_BootInitDone.flg";
+    if (GetFileAttributesW(doneFlag.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (hMutex) CloseHandle(hMutex);
+        return 0;
+    }
+    WriteAsciiFile(doneFlag, "1\r\n");
+
+    // 1. Always restore C: (and recorded internal drives) FIRST so host partitions are accessible!
+    RunPeFixDrivesMode();
+
+    // 2. Check if Auto-Network Sync was requested in OneTimePE_Bridge.ini before rebooting
+    bool shouldApplyNet = false;
+    std::wstring foundBridgeDir;
+    for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
+        if (drv == L'X') continue;
+        std::wstring candDir = std::wstring(1, drv) + L":\\Windows\\Temp";
+        std::wstring candIni = JoinPath(candDir, L"OneTimePE_Bridge.ini");
+        if (GetFileAttributesW(candIni.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            int autoNetVal = static_cast<int>(GetPrivateProfileIntW(L"Bridge", L"AutoApplyNet", 0, candIni.c_str()));
+            if (autoNetVal == 1) {
+                shouldApplyNet = true;
+                foundBridgeDir = candDir;
+            }
+            break;
+        }
+    }
+
+    int rc = 0;
+    if (shouldApplyNet) {
+        rc = RunPeAutoNetMode(foundBridgeDir.empty() ? appDir : foundBridgeDir);
+    }
+
+    if (hMutex) CloseHandle(hMutex);
+    return rc;
 }
 
 // ============================================================================
@@ -2639,6 +3893,16 @@ int RunPeAutoNetMode(const std::wstring& appDir) {
     std::wstring resolvedDir = appDir;
     if (GetFileAttributesW(JoinPath(resolvedDir, L"NetConfig\\netconfig.ini").c_str()) == INVALID_FILE_ATTRIBUTES) {
         std::wstring bridgeIni = JoinPath(resolvedDir, L"OneTimePE_Bridge.ini");
+        if (GetFileAttributesW(bridgeIni.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
+                if (drv == L'X') continue;
+                std::wstring cand = std::wstring(1, drv) + L":\\Windows\\Temp\\OneTimePE_Bridge.ini";
+                if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    bridgeIni = cand;
+                    break;
+                }
+            }
+        }
         if (GetFileAttributesW(bridgeIni.c_str()) != INVALID_FILE_ATTRIBUTES) {
             wchar_t relBuf[MAX_PATH * 2]{};
             GetPrivateProfileStringW(L"Bridge", L"RelAppDir", L"", relBuf, _countof(relBuf), bridgeIni.c_str());
