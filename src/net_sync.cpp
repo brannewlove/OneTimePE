@@ -4128,45 +4128,90 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
     HWND hEditTarget = nullptr;
     for (const auto& c : children) {
         if (c.cls.find(L"edit") != std::wstring::npos) {
+            if (!IsWindowVisible(c.hWnd) || !IsWindowEnabled(c.hWnd)) continue;
+            LONG style = GetWindowLongW(c.hWnd, GWL_STYLE);
+            if (style & ES_READONLY) continue;
             hEditTarget = c.hWnd;
             break;
         }
     }
 
+    bool codeSetOk = false;
     if (hEditTarget) {
-        logRemote(L"인증번호 입력 Edit 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hEditTarget)) + L") -> WM_SETTEXT 주입");
+        logRemote(L"인증번호 입력 Edit 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hEditTarget)) + L") -> WM_SETTEXT 주입 시도");
         SetFocus(hEditTarget);
         SendMessageW(hEditTarget, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(code.c_str()));
-        SendMessageW(hEditTarget, EM_SETSEL, 0, -1);
-    } else {
-        logRemote(L"표준 Edit 컨트롤이 감지되지 않아 키보드/클립보드 주입으로 대체합니다.");
+
+        wchar_t verifyBuf[128]{};
+        GetWindowTextW(hEditTarget, verifyBuf, _countof(verifyBuf));
+        if (wcscmp(verifyBuf, code.c_str()) == 0) {
+            codeSetOk = true;
+            logRemote(L"인증번호 WM_SETTEXT 입력 검증 완료: [" + code + L"]");
+        } else {
+            logRemote(L"WM_SETTEXT 검증 불일치 -> 클립보드 붙여넣기(Ctrl+V) 모드로 전환합니다.");
+        }
     }
 
-    // 3중 주입: 클립보드 복사 후 Ctrl+V 및 WM_CHAR
-    if (OpenClipboard(nullptr)) {
-        EmptyClipboard();
-        size_t bytes = (code.size() + 1) * sizeof(wchar_t);
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (hMem) {
-            void* p = GlobalLock(hMem);
-            if (p) {
-                memcpy(p, code.c_str(), bytes);
-                GlobalUnlock(hMem);
-                SetClipboardData(CF_UNICODETEXT, hMem);
+    // Fallback: If WM_SETTEXT didn't take effect (custom edit control, owner-drawn, etc.)
+    if (!codeSetOk) {
+        if (hEditTarget) {
+            SetFocus(hEditTarget);
+            SendMessageW(hEditTarget, EM_SETSEL, 0, -1);
+        } else {
+            SetFocus(hTargetWnd);
+        }
+
+        // Clear existing text by Ctrl+A -> Backspace
+        keybd_event(VK_CONTROL, 0, 0, 0);
+        keybd_event('A', 0, 0, 0);
+        Sleep(30);
+        keybd_event('A', 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+        Sleep(30);
+        keybd_event(VK_BACK, 0, 0, 0);
+        Sleep(30);
+        keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0);
+        Sleep(30);
+
+        // Clipboard Ctrl+V injection
+        if (OpenClipboard(nullptr)) {
+            EmptyClipboard();
+            size_t bytes = (code.size() + 1) * sizeof(wchar_t);
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if (hMem) {
+                void* p = GlobalLock(hMem);
+                if (p) {
+                    memcpy(p, code.c_str(), bytes);
+                    GlobalUnlock(hMem);
+                    SetClipboardData(CF_UNICODETEXT, hMem);
+                }
+            }
+            CloseClipboard();
+        }
+        keybd_event(VK_CONTROL, 0, 0, 0);
+        keybd_event('V', 0, 0, 0);
+        Sleep(40);
+        keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+        Sleep(100);
+
+        if (hEditTarget) {
+            wchar_t verifyBuf2[128]{};
+            GetWindowTextW(hEditTarget, verifyBuf2, _countof(verifyBuf2));
+            if (wcscmp(verifyBuf2, code.c_str()) == 0) {
+                codeSetOk = true;
+                logRemote(L"클립보드(Ctrl+V) 입력 검증 완료: [" + code + L"]");
             }
         }
-        CloseClipboard();
-    }
-    keybd_event(VK_CONTROL, 0, 0, 0);
-    keybd_event('V', 0, 0, 0);
-    Sleep(40);
-    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-    Sleep(100);
 
-    for (wchar_t ch : code) {
-        PostMessageW(hTargetWnd, WM_CHAR, static_cast<WPARAM>(ch), 1);
-        if (hEditTarget) PostMessageW(hEditTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
+        // Secondary fallback if still not matched: direct WM_CHAR typing
+        if (!codeSetOk) {
+            logRemote(L"키보드(WM_CHAR) 직접 입력 전송");
+            for (wchar_t ch : code) {
+                PostMessageW(hTargetWnd, WM_CHAR, static_cast<WPARAM>(ch), 1);
+                if (hEditTarget) PostMessageW(hEditTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
+            }
+        }
     }
     Sleep(250);
 
@@ -4193,24 +4238,19 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         GetWindowTextW(hBtnConnect, btnTxt, _countof(btnTxt));
         logRemote(L"연결 버튼 감지: [" + std::wstring(btnTxt) + L"] -> BM_CLICK 클릭 메시지 전송");
         SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
-        PostMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hBtnConnect), BN_CLICKED), reinterpret_cast<LPARAM>(hBtnConnect));
     } else {
-        logRemote(L"버튼 텍스트 매칭 실패 — 기본 Enter 키(VK_RETURN) 전송으로 연결 시도");
+        logRemote(L"버튼 텍스트 미감지 -> 기본 Enter 키(VK_RETURN) 전송으로 연결 시도");
+        keybd_event(VK_RETURN, 0, 0, 0);
+        Sleep(60);
+        keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
     }
 
-    // Enter 키 전송 (표준 대화상자 기본 버튼 활성화)
-    keybd_event(VK_RETURN, 0, 0, 0);
-    Sleep(60);
-    keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
-    PostMessageW(hTargetWnd, WM_KEYDOWN, VK_RETURN, 0);
-    PostMessageW(hTargetWnd, WM_KEYUP, VK_RETURN, 0);
+    logRemote(L"★ 인증번호(" + code + L") 입력 및 연결 버튼 클릭 완료!");
 
-    logRemote(L"★ 인증번호(" + code + L") 입력 및 연결 버튼/Enter 트리거 전송 완료!");
-
-    // 8. 2초 후 확인 및 1회 추가 보강 (Watchdog)
+    // 8. 2초 후 확인 및 보강 (Watchdog: 창이 계속 머물러 있으면 Enter 1회 전송)
     Sleep(2000);
     if (IsWindow(hTargetWnd) && IsWindowVisible(hTargetWnd)) {
-        logRemote(L"창이 여전히 대기 상태로 감지되어 2차 확인 Enter 트리거를 1회 더 전송합니다.");
+        logRemote(L"창이 여전히 대기 상태로 감지되어 2차 확인 Enter 트리거를 1회 전송합니다.");
         keybd_event(VK_RETURN, 0, 0, 0);
         Sleep(50);
         keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
