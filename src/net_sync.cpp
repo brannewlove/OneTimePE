@@ -4370,7 +4370,14 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             }
         }
 
-        // Step B: Focus the passcode input field cleanly
+        // Clean and prepare authentication code (strip spaces/symbols)
+        std::wstring cleanCode;
+        for (wchar_t ch : code) {
+            if (iswalnum(ch)) cleanCode += ch;
+        }
+        if (cleanCode.empty()) cleanCode = Trim(code);
+
+        // Step B: Focus the passcode input field cleanly and thoroughly clear it
         if (hTargetEdit && IsWindow(hTargetEdit)) {
             logRemote(L"인증번호 입력 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hTargetEdit)) + L") -> 직접 포커스 및 캐럿 활성화");
             SetFocus(hTargetEdit);
@@ -4382,68 +4389,54 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             int cy = (rcEdit.bottom - rcEdit.top) / 2;
             SendMessageW(hTargetEdit, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
             SendMessageW(hTargetEdit, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
-            Sleep(80);
+            Sleep(50);
 
-            // Clear any existing text
+            // Clear any existing text via Win32 messages
             SendMessageW(hTargetEdit, EM_SETSEL, 0, -1);
+            SendMessageW(hTargetEdit, WM_CLEAR, 0, 0);
             SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L""));
         } else {
             logRemote(L"표준 Edit 컨트롤 미발견 (커스텀 스킨/DirectUI 창) -> 창 기본 포커스 유지");
         }
 
-        // Keyboard clear: Ctrl+A -> Backspace
+        // Keyboard clear: Select all + Backspace/Delete multiple times to guarantee clean empty box
         sendCtrlKey('A');
-        sendKeyTap(VK_BACK, 25, 30);
-        sendKeyTap(VK_DELETE, 25, 30);
-        Sleep(50);
-
-        // Step C: Input the authentication code
-        // 1) Direct WM_SETTEXT if edit control is present
-        bool textSetOk = false;
-        if (hTargetEdit && IsWindow(hTargetEdit)) {
-            SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(code.c_str()));
-            SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_CHANGE), reinterpret_cast<LPARAM>(hTargetEdit));
-            SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_UPDATE), reinterpret_cast<LPARAM>(hTargetEdit));
-
-            wchar_t vBuf[128]{};
-            GetWindowTextW(hTargetEdit, vBuf, _countof(vBuf));
-            if (wcscmp(vBuf, code.c_str()) == 0) {
-                textSetOk = true;
-                logRemote(L"인증번호 WM_SETTEXT 주입 검증 완료: [" + code + L"]");
-            }
+        sendKeyTap(VK_BACK, 20, 25);
+        sendKeyTap(VK_DELETE, 20, 25);
+        for (int b = 0; b < 10; ++b) {
+            sendKeyTap(VK_BACK, 15, 20);
+            sendKeyTap(VK_DELETE, 15, 20);
         }
+        Sleep(60);
 
-        // 2) Hardware SendInput typing
-        logRemote(L"키보드(SendInput)로 인증번호 [" + code + L"] 타이핑 전송");
-        typeStringViaKeyboard(code);
+        // Step C: Input the authentication code EXACTLY ONCE via Keyboard
+        logRemote(L"키보드(SendInput)로 인증번호 [" + cleanCode + L"] 입력 시작 (글자수: " +
+                  std::to_wstring(cleanCode.size()) + L")");
+        typeStringViaKeyboard(cleanCode);
         Sleep(150);
 
-        // 3) Clipboard paste fallback if input is still empty
+        // Step D: Verify the entered text if Edit control is available
         if (hTargetEdit && IsWindow(hTargetEdit)) {
             wchar_t vBuf[128]{};
             GetWindowTextW(hTargetEdit, vBuf, _countof(vBuf));
-            if (wcslen(vBuf) == 0 && !textSetOk) {
-                logRemote(L"입력칸이 비어 있어 클립보드 붙여넣기(Ctrl+V) 보조 실행");
-                if (OpenClipboard(nullptr)) {
-                    EmptyClipboard();
-                    size_t bytes = (code.size() + 1) * sizeof(wchar_t);
-                    HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-                    if (hMem) {
-                        void* p = GlobalLock(hMem);
-                        if (p) {
-                            memcpy(p, code.c_str(), bytes);
-                            GlobalUnlock(hMem);
-                            SetClipboardData(CF_UNICODETEXT, hMem);
-                        }
-                    }
-                    CloseClipboard();
-                }
-                sendCtrlKey('V');
-                Sleep(100);
+            logRemote(L"입력란 텍스트 확인: 현재=[" + std::wstring(vBuf) + L"], 목표=[" + cleanCode + L"]");
+
+            if (wcscmp(vBuf, cleanCode.c_str()) != 0) {
+                // If keyboard typing produced empty, duplicate, or incorrect text,
+                // enforce the exact code directly via WM_SETTEXT without appending!
+                logRemote(L"텍스트 불일치 감지 -> WM_SETTEXT 로 정확한 인증번호 강제 재설정: [" + cleanCode + L"]");
+                SendMessageW(hTargetEdit, EM_SETSEL, 0, -1);
+                SendMessageW(hTargetEdit, WM_CLEAR, 0, 0);
+                SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(cleanCode.c_str()));
+                SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_CHANGE), reinterpret_cast<LPARAM>(hTargetEdit));
+                SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_UPDATE), reinterpret_cast<LPARAM>(hTargetEdit));
+
+                GetWindowTextW(hTargetEdit, vBuf, _countof(vBuf));
+                logRemote(L"최종 보정 후 텍스트: [" + std::wstring(vBuf) + L"]");
             }
         }
 
-        // Step D: Trigger Connect!
+        // Step E: Trigger Connect!
         // 1) First and foremost: Press Enter (VK_RETURN) directly in the active input box
         logRemote(L"1차 연결 실행: 입력창에서 Enter(VK_RETURN) 키 전송");
         sendKeyTap(VK_RETURN, 50, 80);
@@ -4472,16 +4465,31 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             SendMessageW(hBtnConnect, WM_LBUTTONUP, 0, MAKELPARAM(bx, by));
         }
 
-        // Wait 2.5s and check connection progress
-        Sleep(2500);
-        if (!IsWindow(hTargetWnd) || !IsWindowVisible(hTargetWnd)) {
-            logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력창 닫힘/전환 완료)!");
-            break;
+        // Wait and monitor connection progress (up to 15 seconds)
+        logRemote(L"원격 서버 연결 대기 및 상태 감시 중 (최대 15초)...");
+        bool connected = false;
+        for (int w = 0; w < 30; ++w) {
+            Sleep(500);
+            if (!IsWindow(hTargetWnd) || !IsWindowVisible(hTargetWnd)) {
+                logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력창 닫힘/전환 완료)!");
+                connected = true;
+                break;
+            }
+            if (hTargetEdit && (!IsWindow(hTargetEdit) || !IsWindowVisible(hTargetEdit) || !IsWindowEnabled(hTargetEdit))) {
+                logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력 컨트롤 비활성/전환 완료)!");
+                connected = true;
+                break;
+            }
+            if (w == 8) { // After 4 seconds of waiting, send Enter / Click once more as fallback without re-typing
+                logRemote(L"연결 지연 감지 -> Enter 및 연결 버튼 보조 재전송 (재타이핑 없음)");
+                sendKeyTap(VK_RETURN, 50, 80);
+                if (hBtnConnect && IsWindow(hBtnConnect)) {
+                    SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
+                }
+            }
         }
-        if (hTargetEdit && (!IsWindow(hTargetEdit) || !IsWindowVisible(hTargetEdit) || !IsWindowEnabled(hTargetEdit))) {
-            logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력 컨트롤 비활성/전환 완료)!");
-            break;
-        }
+
+        if (connected) break;
     }
 
     // Restore normal Z-order so subsequent remote screen streaming windows work normally

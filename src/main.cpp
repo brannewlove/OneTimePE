@@ -3208,7 +3208,7 @@ void PopulateInitialValues() {
     SendMessageW(g_hChkRemoteSupport, BM_SETCHECK, g_cfg.remoteSupportEnable ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(g_hEdtRemoteCode, g_cfg.remoteSupportCode.c_str());
     SetWindowTextW(g_hEdtRemoteExe, g_cfg.remoteSupportExe.c_str());
-    SendMessageW(g_hEdtRemoteCode, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"예: 123456"));
+    SendMessageW(g_hEdtRemoteCode, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"예: 1234 또는 123456"));
     SendMessageW(g_hEdtRemoteExe, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"ManualLauncher.exe"));
 
     ScanLocalPeFiles(false);
