@@ -17,6 +17,7 @@
 #include <virtdisk.h>
 #include <iphlpapi.h>
 #include <wlanapi.h>
+#include <tlhelp32.h>
 
 #include "net_sync.h"
 
@@ -26,6 +27,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <map>
 #include <set>
 
@@ -61,6 +63,12 @@ std::wstring JoinPath(const std::wstring& base, const std::wstring& rel) {
     }
     if (rel.front() == L'\\' || rel.front() == L'/') return base + rel;
     return base + L"\\" + rel;
+}
+
+std::wstring FileNameFromPath(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) return path.substr(slash + 1);
+    return path;
 }
 
 void EnsureDirectoryRecursive(const std::wstring& dirPath) {
@@ -494,6 +502,20 @@ bool WriteAsciiFile(const std::wstring& path, const std::string& content) {
     }
     HANDLE hFile = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    BOOL ok = WriteFile(hFile, content.data(), static_cast<DWORD>(content.size()), &written, nullptr);
+    CloseHandle(hFile);
+    return ok != FALSE;
+}
+
+bool AppendAsciiFile(const std::wstring& path, const std::string& content) {
+    DWORD attr = GetFileAttributesW(path.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_READONLY)) {
+        SetFileAttributesW(path.c_str(), attr & ~FILE_ATTRIBUTE_READONLY);
+    }
+    HANDLE hFile = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     BOOL ok = WriteFile(hFile, content.data(), static_cast<DWORD>(content.size()), &written, nullptr);
@@ -2461,10 +2483,10 @@ struct OtpeVolSetGptAttrs {
 };
 static_assert(sizeof(OtpeVolSetGptAttrs) == 16, "OtpeVolSetGptAttrs ABI size mismatch");
 
-constexpr GUID kGptTypeBasicData = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
-constexpr GUID kGptTypeEsp       = { 0xc12a7328, 0xf81f, 0x11d2, { 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b } };
-constexpr GUID kGptTypeMsr       = { 0xe3c9e316, 0x0b5c, 0x4db8, { 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15, 0xae } };
-constexpr GUID kGptTypeWinRe     = { 0xde94bba4, 0x06d1, 0x4d40, { 0xa1, 0x6a, 0xbf, 0xd5, 0x01, 0x79, 0xd6, 0xac } };
+[[maybe_unused]] constexpr GUID kGptTypeBasicData = { 0xebd0a0a2, 0xb9e5, 0x4433, { 0x87, 0xc0, 0x68, 0xb6, 0xb7, 0x26, 0x99, 0xc7 } };
+[[maybe_unused]] constexpr GUID kGptTypeEsp       = { 0xc12a7328, 0xf81f, 0x11d2, { 0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b } };
+[[maybe_unused]] constexpr GUID kGptTypeMsr       = { 0xe3c9e316, 0x0b5c, 0x4db8, { 0x81, 0x7d, 0xf9, 0x2d, 0xf0, 0x02, 0x15, 0xae } };
+[[maybe_unused]] constexpr GUID kGptTypeWinRe     = { 0xde94bba4, 0x06d1, 0x4d40, { 0xa1, 0x6a, 0xbf, 0xd5, 0x01, 0x79, 0xd6, 0xac } };
 
 bool GuidEq(const GUID& a, const GUID& b) {
     return std::memcmp(&a, &b, sizeof(GUID)) == 0;
@@ -2613,7 +2635,10 @@ bool PrependLinePreservingRawEncoding(const std::wstring& filePath,
 
 bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
                          bool autoApplyNetwork,
-                         const LogCallback& logCb) {
+                         const LogCallback& logCb,
+                         bool remoteSupportEnable,
+                         const std::wstring& remoteSupportCode,
+                         const std::wstring& remoteSupportExe) {
     wchar_t winDir[MAX_PATH]{};
     if (GetWindowsDirectoryW(winDir, MAX_PATH) == 0) return false;
 
@@ -2709,6 +2734,24 @@ bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
     }
     WritePrivateProfileStringW(L"Bridge", L"AutoApplyNet", autoApplyNetwork ? L"1" : L"0", bridgeIni.c_str());
 
+    // 3. Remote Support (AnySupport / ManualLauncher.exe) settings
+    std::wstring safeExe = remoteSupportExe.empty() ? L"ManualLauncher.exe" : remoteSupportExe;
+    WritePrivateProfileStringW(L"RemoteSupport", L"Enable", remoteSupportEnable ? L"1" : L"0", bridgeIni.c_str());
+    WritePrivateProfileStringW(L"RemoteSupport", L"Code", remoteSupportCode.c_str(), bridgeIni.c_str());
+    WritePrivateProfileStringW(L"RemoteSupport", L"ExeName", safeExe.c_str(), bridgeIni.c_str());
+
+    // Export raw code file and environment CMD for custom scripts in WinPE
+    std::wstring remoteCodePath = JoinPath(tempDir, L"OneTimePE_RemoteCode.txt");
+    WriteAsciiFile(remoteCodePath, WideToUtf8(remoteSupportCode) + "\r\n");
+
+    std::wstring remoteCmd = JoinPath(tempDir, L"OneTimePE_RemoteSupport.cmd");
+    std::string codeOem = WideToOemOrAcp(remoteSupportCode, GetOEMCP());
+    std::string exeOem  = WideToOemOrAcp(safeExe, GetOEMCP());
+    std::string cmdContent = "@set \"ANYSUPPORT_CODE=" + codeOem + "\"\r\n"
+                             "@set \"ANYSUPPORT_EXE=" + exeOem + "\"\r\n"
+                             "@set \"REMOTE_CODE=" + codeOem + "\"\r\n";
+    WriteAsciiFile(remoteCmd, cmdContent);
+
     wchar_t selfExe[MAX_PATH * 4]{};
     if (GetModuleFileNameW(nullptr, selfExe, _countof(selfExe)) > 0) {
         CopyFileW(selfExe, JoinPath(tempDir, L"OneTimePE_Runner.exe").c_str(), FALSE);
@@ -2721,6 +2764,9 @@ bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
             mappedLetters += std::wstring(1, records[i].letter) + L":";
         }
         logCb(L"PE 부팅용 내장 드라이브 문자 매핑 기록 완료 (" + mappedLetters + L") -> " + driveMapPath);
+        if (remoteSupportEnable && !remoteSupportCode.empty()) {
+            logCb(L"애니서포트(원격지원) 자동 연결 설정 기록 완료 [인증번호: " + remoteSupportCode + L", 대상: " + safeExe + L"]");
+        }
     }
     return true;
 }
@@ -3855,6 +3901,325 @@ int RunPeFixDrivesMode() {
     return osOk ? 0 : 1;
 }
 
+// ============================================================================
+// AnySupport (ManualLauncher.exe) Auto-Connect Engine inside WinPE
+// ============================================================================
+int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName) {
+    if (code.empty()) return 0;
+
+    auto logRemote = [](const std::wstring& msg) {
+        wchar_t winDir[MAX_PATH]{};
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        std::wstring l1 = JoinPath(winDir, L"Temp\\OneTimePE_RemoteSupport.log");
+        std::wstring l2 = L"C:\\Windows\\Temp\\OneTimePE_RemoteSupport.log";
+        std::string line = WideToUtf8(msg) + "\r\n";
+        AppendAsciiFile(l1, line);
+        if (_wcsicmp(l1.c_str(), l2.c_str()) != 0) {
+            AppendAsciiFile(l2, line);
+        }
+    };
+
+    logRemote(L"============================================================");
+    logRemote(L"애니서포트(원격지원) 자동 연결 엔진 시작");
+    logRemote(L"• 인증번호: " + code);
+    logRemote(L"• 대상 실행 파일명: " + (exeName.empty() ? L"ManualLauncher.exe" : exeName));
+    logRemote(L"============================================================");
+
+    // 1. 네트워크 준비 대기 (최대 15초)
+    logRemote(L"원격 접속을 위한 네트워크 IP 할당 상태 확인 중...");
+    for (int t = 0; t < 15; ++t) {
+        DWORD outBufLen = 15000;
+        std::vector<BYTE> buf(outBufLen);
+        auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        DWORD flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+        DWORD ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &outBufLen);
+        if (ret == ERROR_BUFFER_OVERFLOW) {
+            buf.resize(outBufLen);
+            addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+            ret = GetAdaptersAddresses(AF_INET, flags, nullptr, addrs, &outBufLen);
+        }
+        bool hasIp = false;
+        if (ret == NO_ERROR) {
+            for (auto* cur = addrs; cur != nullptr; cur = cur->Next) {
+                if (cur->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                if (cur->OperStatus != IfOperStatusUp) continue;
+                if (cur->FirstUnicastAddress != nullptr) {
+                    hasIp = true;
+                    break;
+                }
+            }
+        }
+        if (hasIp) {
+            logRemote(L"네트워크 정상 연결 확인됨 (" + std::to_wstring(t + 1) + L"초 소요).");
+            break;
+        }
+        Sleep(1000);
+    }
+
+    // 2. 프로세스 실행 여부 확인 및 필요 시 자동 기동
+    std::wstring targetExe = exeName.empty() ? L"ManualLauncher.exe" : exeName;
+    auto findProcPid = [&](const std::wstring& name) -> DWORD {
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE) return 0;
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        DWORD foundPid = 0;
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, name.c_str()) == 0) {
+                    foundPid = pe.th32ProcessID;
+                    break;
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+        return foundPid;
+    };
+
+    DWORD targetPid = findProcPid(targetExe);
+    if (targetPid == 0) {
+        logRemote(targetExe + L" 프로세스가 아직 실행되지 않아 디스크 탐색을 시작합니다...");
+        std::wstring foundExePath;
+        const std::vector<std::wstring> searchSubPaths = {
+            L"",
+            L"\\Program Files",
+            L"\\Program Files (x86)",
+            L"\\PETools",
+            L"\\Tools",
+            L"\\AnySupport",
+            L"\\Windows\\System32"
+        };
+        const wchar_t drvs[] = { L'X', L'C', L'D', L'Y', L'E', L'F' };
+        for (wchar_t d : drvs) {
+            for (const auto& sub : searchSubPaths) {
+                std::wstring cand = std::wstring(1, d) + L":" + sub + L"\\" + targetExe;
+                if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    foundExePath = cand;
+                    break;
+                }
+            }
+            if (!foundExePath.empty()) break;
+        }
+
+        if (!foundExePath.empty()) {
+            logRemote(L"실행 파일 발견: " + foundExePath + L" -> 인증번호 매개변수와 함께 실행합니다.");
+            std::wstring cmdLine = L"\"" + foundExePath + L"\" " + code;
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(foundExePath.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                targetPid = pi.dwProcessId;
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                logRemote(L"프로세스 실행 완료 (PID: " + std::to_wstring(targetPid) + L")");
+            } else {
+                logRemote(L"CreateProcess 실패 (오류 코드: " + std::to_wstring(GetLastError()) + L")");
+            }
+        } else {
+            logRemote(L"드라이브 검색에서 직접 실행 파일을 찾지 못했습니다. 시스템 자동실행 스크립트가 기동할 때까지 창 감시 루프로 대기합니다.");
+        }
+    } else {
+        logRemote(L"이미 실행 중인 " + targetExe + L" 프로세스 감지됨 (PID: " + std::to_wstring(targetPid) + L")");
+    }
+
+    // 3. 애니서포트 윈도우 감시 루프 (최대 60초)
+    struct WindowSearchCtx {
+        DWORD targetPid;
+        std::wstring exeName;
+        HWND hWndFound = nullptr;
+    };
+
+    auto enumWndProc = [](HWND hWnd, LPARAM lParam) -> BOOL {
+        auto* ctx = reinterpret_cast<WindowSearchCtx*>(lParam);
+        if (!IsWindowVisible(hWnd)) return TRUE;
+
+        RECT rc{};
+        GetWindowRect(hWnd, &rc);
+        if ((rc.right - rc.left) < 120 || (rc.bottom - rc.top) < 80) return TRUE;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hWnd, &pid);
+        if (ctx->targetPid != 0 && pid == ctx->targetPid) {
+            ctx->hWndFound = hWnd;
+            return FALSE;
+        }
+
+        wchar_t titleBuf[256]{};
+        GetWindowTextW(hWnd, titleBuf, _countof(titleBuf));
+        std::wstring title = ToLower(titleBuf);
+        if (title.find(L"애니서포트") != std::wstring::npos ||
+            title.find(L"anysupport") != std::wstring::npos ||
+            title.find(L"manuallauncher") != std::wstring::npos ||
+            title.find(L"원격지원") != std::wstring::npos) {
+            ctx->hWndFound = hWnd;
+            return FALSE;
+        }
+
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc) {
+            wchar_t imgPath[MAX_PATH * 2]{};
+            DWORD imgSize = _countof(imgPath);
+            if (QueryFullProcessImageNameW(hProc, 0, imgPath, &imgSize)) {
+                std::wstring fn = ToLower(FileNameFromPath(imgPath));
+                if (fn == ToLower(ctx->exeName)) {
+                    ctx->hWndFound = hWnd;
+                    CloseHandle(hProc);
+                    return FALSE;
+                }
+            }
+            CloseHandle(hProc);
+        }
+        return TRUE;
+    };
+
+    HWND hTargetWnd = nullptr;
+    logRemote(L"애니서포트 프로그램 창 감시 시작 (최대 60초 대기)...");
+    for (int t = 0; t < 120; ++t) {
+        WindowSearchCtx ctx{ targetPid, targetExe, nullptr };
+        EnumWindows(enumWndProc, reinterpret_cast<LPARAM>(&ctx));
+        if (ctx.hWndFound != nullptr) {
+            hTargetWnd = ctx.hWndFound;
+            break;
+        }
+        Sleep(500);
+    }
+
+    if (!hTargetWnd) {
+        logRemote(L"경고: 60초 대기 시간 내에 애니서포트 창이 감지되지 않아 자동 입력을 종료합니다.");
+        return 1;
+    }
+
+    wchar_t foundTitle[256]{};
+    GetWindowTextW(hTargetWnd, foundTitle, _countof(foundTitle));
+    logRemote(L"★ 애니서포트 창 감지 성공! 제목: [" + std::wstring(foundTitle) + L"], HWND=" + std::to_wstring(reinterpret_cast<uintptr_t>(hTargetWnd)));
+
+    // 4. 창 활성화 및 렌더링 대기
+    Sleep(600);
+    ShowWindow(hTargetWnd, SW_SHOWNORMAL);
+    SetForegroundWindow(hTargetWnd);
+    BringWindowToTop(hTargetWnd);
+    SetActiveWindow(hTargetWnd);
+    Sleep(300);
+
+    // 5. 자식 컨트롤 열거
+    struct ChildCtrl {
+        HWND hWnd;
+        std::wstring cls;
+        std::wstring text;
+        int id;
+        RECT rc;
+    };
+    std::vector<ChildCtrl> children;
+    auto enumChildProc = [](HWND hChild, LPARAM lParam) -> BOOL {
+        auto* vec = reinterpret_cast<std::vector<ChildCtrl>*>(lParam);
+        wchar_t clsBuf[128]{};
+        GetClassNameW(hChild, clsBuf, _countof(clsBuf));
+        wchar_t txtBuf[256]{};
+        GetWindowTextW(hChild, txtBuf, _countof(txtBuf));
+        RECT r{};
+        GetWindowRect(hChild, &r);
+        vec->push_back({ hChild, ToLower(clsBuf), txtBuf, GetDlgCtrlID(hChild), r });
+        return TRUE;
+    };
+    EnumChildWindows(hTargetWnd, enumChildProc, reinterpret_cast<LPARAM>(&children));
+    logRemote(L"창 내부 자식 컨트롤 수: " + std::to_wstring(children.size()) + L"개");
+
+    // 6. Edit 컨트롤에 인증번호 입력
+    HWND hEditTarget = nullptr;
+    for (const auto& c : children) {
+        if (c.cls.find(L"edit") != std::wstring::npos) {
+            hEditTarget = c.hWnd;
+            break;
+        }
+    }
+
+    if (hEditTarget) {
+        logRemote(L"인증번호 입력 Edit 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hEditTarget)) + L") -> WM_SETTEXT 주입");
+        SetFocus(hEditTarget);
+        SendMessageW(hEditTarget, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(code.c_str()));
+        SendMessageW(hEditTarget, EM_SETSEL, 0, -1);
+    } else {
+        logRemote(L"표준 Edit 컨트롤이 감지되지 않아 키보드/클립보드 주입으로 대체합니다.");
+    }
+
+    // 3중 주입: 클립보드 복사 후 Ctrl+V 및 WM_CHAR
+    if (OpenClipboard(nullptr)) {
+        EmptyClipboard();
+        size_t bytes = (code.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hMem) {
+            void* p = GlobalLock(hMem);
+            if (p) {
+                memcpy(p, code.c_str(), bytes);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_UNICODETEXT, hMem);
+            }
+        }
+        CloseClipboard();
+    }
+    keybd_event(VK_CONTROL, 0, 0, 0);
+    keybd_event('V', 0, 0, 0);
+    Sleep(40);
+    keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    Sleep(100);
+
+    for (wchar_t ch : code) {
+        PostMessageW(hTargetWnd, WM_CHAR, static_cast<WPARAM>(ch), 1);
+        if (hEditTarget) PostMessageW(hEditTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
+    }
+    Sleep(250);
+
+    // 7. 연결/접속 버튼 클릭
+    HWND hBtnConnect = nullptr;
+    for (const auto& c : children) {
+        if (c.cls.find(L"button") != std::wstring::npos) {
+            std::wstring lowT = ToLower(c.text);
+            if (lowT.find(L"연결") != std::wstring::npos ||
+                lowT.find(L"접속") != std::wstring::npos ||
+                lowT.find(L"확인") != std::wstring::npos ||
+                lowT.find(L"시작") != std::wstring::npos ||
+                lowT.find(L"connect") != std::wstring::npos ||
+                lowT.find(L"ok") != std::wstring::npos ||
+                lowT.find(L"start") != std::wstring::npos) {
+                hBtnConnect = c.hWnd;
+                break;
+            }
+        }
+    }
+
+    if (hBtnConnect) {
+        wchar_t btnTxt[64]{};
+        GetWindowTextW(hBtnConnect, btnTxt, _countof(btnTxt));
+        logRemote(L"연결 버튼 감지: [" + std::wstring(btnTxt) + L"] -> BM_CLICK 클릭 메시지 전송");
+        SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
+        PostMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hBtnConnect), BN_CLICKED), reinterpret_cast<LPARAM>(hBtnConnect));
+    } else {
+        logRemote(L"버튼 텍스트 매칭 실패 — 기본 Enter 키(VK_RETURN) 전송으로 연결 시도");
+    }
+
+    // Enter 키 전송 (표준 대화상자 기본 버튼 활성화)
+    keybd_event(VK_RETURN, 0, 0, 0);
+    Sleep(60);
+    keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
+    PostMessageW(hTargetWnd, WM_KEYDOWN, VK_RETURN, 0);
+    PostMessageW(hTargetWnd, WM_KEYUP, VK_RETURN, 0);
+
+    logRemote(L"★ 인증번호(" + code + L") 입력 및 연결 버튼/Enter 트리거 전송 완료!");
+
+    // 8. 2초 후 확인 및 1회 추가 보강 (Watchdog)
+    Sleep(2000);
+    if (IsWindow(hTargetWnd) && IsWindowVisible(hTargetWnd)) {
+        logRemote(L"창이 여전히 대기 상태로 감지되어 2차 확인 Enter 트리거를 1회 더 전송합니다.");
+        keybd_event(VK_RETURN, 0, 0, 0);
+        Sleep(50);
+        keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
+    }
+
+    logRemote(L"=== 애니서포트 원격지원 자동화 완료 ===");
+    return 0;
+}
+
 int RunPeBootInitMode(const std::wstring& appDir) {
     // Prevent duplicate concurrent execution across startnet.cmd + winpeshl.ini + PECMD.INI + Startup hooks
     HANDLE hMutex = CreateMutexW(nullptr, FALSE, L"Local\\OneTimePE_BootInit_Active");
@@ -3874,9 +4239,13 @@ int RunPeBootInitMode(const std::wstring& appDir) {
     // 1. Always restore C: (and recorded internal drives) FIRST so host partitions are accessible!
     RunPeFixDrivesMode();
 
-    // 2. Check if Auto-Network Sync was requested in OneTimePE_Bridge.ini before rebooting
+    // 2. Check if Auto-Network Sync and Remote Support were requested in OneTimePE_Bridge.ini
     bool shouldApplyNet = false;
+    bool shouldRemoteSupport = false;
+    std::wstring remoteCode;
+    std::wstring remoteExe = L"ManualLauncher.exe";
     std::wstring foundBridgeDir;
+
     for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
         if (drv == L'X') continue;
         std::wstring candDir = std::wstring(1, drv) + L":\\Windows\\Temp";
@@ -3885,8 +4254,21 @@ int RunPeBootInitMode(const std::wstring& appDir) {
             int autoNetVal = static_cast<int>(GetPrivateProfileIntW(L"Bridge", L"AutoApplyNet", 0, candIni.c_str()));
             if (autoNetVal == 1) {
                 shouldApplyNet = true;
-                foundBridgeDir = candDir;
             }
+            int remVal = static_cast<int>(GetPrivateProfileIntW(L"RemoteSupport", L"Enable", 0, candIni.c_str()));
+            if (remVal == 1) {
+                wchar_t cBuf[128]{};
+                GetPrivateProfileStringW(L"RemoteSupport", L"Code", L"", cBuf, _countof(cBuf), candIni.c_str());
+                wchar_t eBuf[MAX_PATH]{};
+                GetPrivateProfileStringW(L"RemoteSupport", L"ExeName", L"ManualLauncher.exe", eBuf, _countof(eBuf), candIni.c_str());
+                remoteCode = Trim(cBuf);
+                remoteExe  = Trim(eBuf);
+                if (remoteExe.empty()) remoteExe = L"ManualLauncher.exe";
+                if (!remoteCode.empty()) {
+                    shouldRemoteSupport = true;
+                }
+            }
+            foundBridgeDir = candDir;
             break;
         }
     }
@@ -3894,6 +4276,13 @@ int RunPeBootInitMode(const std::wstring& appDir) {
     int rc = 0;
     if (shouldApplyNet) {
         rc = RunPeAutoNetMode(foundBridgeDir.empty() ? appDir : foundBridgeDir);
+    }
+
+    // Launch AnySupport Auto-Connect asynchronously so boot init is not blocked
+    if (shouldRemoteSupport && !remoteCode.empty()) {
+        std::thread([remoteCode, remoteExe]() {
+            RunPeRemoteSupportMode(remoteCode, remoteExe);
+        }).detach();
     }
 
     if (hMutex) CloseHandle(hMutex);

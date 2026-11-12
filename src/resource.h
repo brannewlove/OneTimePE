@@ -32,12 +32,17 @@
 #define IDC_LBL_SECSTATUS       1111
 #define IDC_BTN_CHECK_BL        1112
 
-// Group 3: PE Auto-Network & WIM Unattended Patch
+// Group 3: PE Auto-Network & Remote Support & WIM Unattended Patch
 #define IDC_LBL_NETSTATUS       1151
 #define IDC_CHK_AUTONET         1152
 #define IDC_CHK_EXPORT_DRV      1153
 #define IDC_BTN_SYNC_NET        1154
 #define IDC_BTN_PATCH_WIM       1155
+#define IDC_CHK_REMOTE_SUPPORT  1156
+#define IDC_LBL_REMOTE_CODE     1157
+#define IDC_EDT_REMOTE_CODE     1158
+#define IDC_LBL_REMOTE_EXE      1159
+#define IDC_EDT_REMOTE_EXE      1160
 
 // Group 4: Status & Actions
 #define IDC_LBL_BCDSTATUS       1201

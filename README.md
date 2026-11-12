@@ -1,8 +1,8 @@
-# OneTimePE - 1회성 내장 WinPE & 커스텀PE 매니저
+# OneTimePE - 1회성 내장 WinPE & 커스텀PE 매니저 (v1.4)
 
 USB 이동식 드라이브 없이 내장 드라이브의 폴더에 PE 파일(`*.wim`, `*.sdi`)을 넣고, **다음 1회 재부팅만 WinPE로 부팅한 뒤 다시 재부팅하면 자동으로 기존 Windows로 복귀**하도록 해 주는 순수 Win32 C++20 네이티브 단일 실행 파일 앱입니다.
 
-**[★ 커스텀PE 가져오기]** 기능을 통해 커스텀 PE `.iso` 파일이나 폴더의 내부 `BCD`를 분석해 전용 `.wim` + 전용 `.sdi` + 부팅 옵션(`nointegritychecks` 등)을 원클릭 세팅할 수 있으며, 선택 옵션으로 **PE 부팅 시 기존 드라이브 문자(`C:` 등) 미설정·숨김·오프라인 속성(케이스 B) 자동 복구 패치** 및 **무인 네트워크 자동 연결**을 지원합니다.
+**[★ 커스텀PE 가져오기]** 기능을 통해 커스텀 PE `.iso` 파일이나 폴더의 내부 `BCD`를 분석해 전용 `.wim` + 전용 `.sdi` + 부팅 옵션(`nointegritychecks` 등)을 원클릭 세팅할 수 있으며, 선택 옵션으로 **PE 부팅 시 기존 드라이브 문자(`C:` 등) 미설정·숨김·오프라인 속성(케이스 B) 자동 복구 패치**, **무인 네트워크 자동 연결**, 그리고 **원격지원(애니서포트: `ManualLauncher.exe`) 부팅 전 인증번호 지정 및 부팅 후 자동 입력·연결**을 지원합니다.
 
 ## 폴더 구조
 
@@ -51,7 +51,8 @@ OneTimePE/
 | **보안 / 암호화 진단** | 대상 드라이브 및 전체 드라이브의 **BitLocker 설정 여부**와 **UEFI Secure Boot 켜짐/꺼짐 상태** 실시간 표시 및 **[BitLocker 상세 확인]** 리포트 제공 |
 | **BitLocker 일시 중지** | 암호화 보호가 켜진 드라이브일 경우 지정한 재부팅 횟수(기본 `2`회) 동안 `manage-bde`로 보호 자동 일시 중지 |
 | **무인 네트워크 동기화** | 물리 NIC(Hyper-V 외부 가상 스위치 브리지 환경 포함) 자동 식별, 고정 IP/DHCP 및 수동/자동 DNS 판별, `pnputil` 랜카드 드라이버 추출, `netsh wlan` Wi-Fi 프로필 XML 추출 |
-| **WIM 무인 자동 실행 패치** | DISM으로 `boot.wim`을 마운트하여 표준 PE(`startnet.cmd`)와 커스텀 PECMD/GUI PE(`winpeshl.ini`, `Startup`) 모두에서 `OneTimePE.exe --pe-apply-net`이 1회 자동 실행되도록 패치 |
+| **원격지원(애니서포트) 자동 연결** | 부팅 전 원격지원 인증번호(예: 6자리 숫자)를 입력하고 부팅하면, WinPE 부팅 후 네트워크 연결 확인 → `ManualLauncher.exe` 감지 및 실행 → 인증번호 3중 주입(`WM_SETTEXT`, 클립보드, 키보드) → [접속/연결] 버튼 자동 클릭으로 무인 원격 대기 모드 진입 |
+| **WIM 무인 자동 실행 패치** | DISM으로 `boot.wim`을 마운트하여 표준 PE(`startnet.cmd`)와 커스텀 PECMD/GUI PE(`winpeshl.ini`, `Startup`) 모두에서 `OneTimePE.exe --pe-boot-init`이 1회 자동 실행되도록 패치 |
 | **추가 변수** | 세미콜론(`;`)으로 구분하여 추가 `bcdedit /set {GUID} <변수>` 명령 지정 가능 |
 
 ## 직접 다시 빌드하기 (`clang++` / `g++` / Visual Studio `cl.exe` 모두 지원)

@@ -135,7 +135,10 @@ CustomPeDiscoveryResult AnalyzeCustomPeMedia(const std::wstring& selectedPath,
 // Snapshot current internal Windows drive letters (C:, D:, ...) + Volume GUIDs & update bridge before PE reboot
 bool ExportDriveMapForPe(const std::wstring& appBcdRelDir,
                          bool autoApplyNetwork,
-                         const LogCallback& logCb);
+                         const LogCallback& logCb,
+                         bool remoteSupportEnable = false,
+                         const std::wstring& remoteSupportCode = L"",
+                         const std::wstring& remoteSupportExe = L"ManualLauncher.exe");
 
 // Export current Windows network settings, Wi-Fi XML, NIC drivers, and bridge pointer
 bool ExportNetworkConfigForPe(const std::wstring& appDir,
@@ -153,7 +156,11 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
 // Executed silently inside WinPE to unlock hidden/offline attributes and restore C: (and fixed drives)
 int RunPeFixDrivesMode();
 
-// Executed silently inside WinPE at startup ("--pe-boot-init"): fixes C: drive map first, then applies network if enabled
+// Executed silently inside WinPE to launch/find AnySupport (ManualLauncher.exe), inject code, and click Connect
+int RunPeRemoteSupportMode(const std::wstring& code,
+                           const std::wstring& exeName = L"ManualLauncher.exe");
+
+// Executed silently inside WinPE at startup ("--pe-boot-init"): fixes C: drive map, applies network, and auto-connects remote support
 int RunPeBootInitMode(const std::wstring& appDir);
 
 // Executed silently inside WinPE when launched with "--pe-apply-net"

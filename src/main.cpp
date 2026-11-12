@@ -32,10 +32,10 @@
 
 namespace {
 
-constexpr wchar_t kAppVersion[]      = L"v1.3";
+constexpr wchar_t kAppVersion[]      = L"v1.4";
 constexpr wchar_t kBuildTimestamp[]  = OTPE_WIDE(__DATE__) L" " OTPE_WIDE(__TIME__);
 constexpr wchar_t kWindowClassName[] = L"OneTimePE_MainWindow";
-constexpr wchar_t kWindowTitle[]     = L"OneTimePE v1.3 (커스텀PE & C: 자동복구) - 1회성 WinPE & 무인 부팅 매니저";
+constexpr wchar_t kWindowTitle[]     = L"OneTimePE v1.4 (원격지원 자동연결 & C: 자동복구) - 1회성 WinPE 매니저";
 constexpr wchar_t kIniSection[]      = L"OneTimePE";
 
 struct AppConfig {
@@ -53,6 +53,9 @@ struct AppConfig {
     std::wstring extraSetArgs       = L"";
     bool autoApplyNetwork           = true;
     bool exportNicDrivers           = true;
+    bool remoteSupportEnable        = false;
+    std::wstring remoteSupportCode  = L"";
+    std::wstring remoteSupportExe   = L"ManualLauncher.exe";
     bool importPatchDriveFix        = true;
     std::wstring patchedWimPath     = L"";
     std::wstring patchedWimSig      = L"";
@@ -164,6 +167,11 @@ HWND g_hChkAutoNet    = nullptr;
 HWND g_hChkExportDrv  = nullptr;
 HWND g_hBtnSyncNet    = nullptr;
 HWND g_hBtnPatchWim   = nullptr;
+HWND g_hChkRemoteSupport = nullptr;
+HWND g_hLblRemoteCode    = nullptr;
+HWND g_hEdtRemoteCode    = nullptr;
+HWND g_hLblRemoteExe     = nullptr;
+HWND g_hEdtRemoteExe     = nullptr;
 
 HWND g_hGrpActions    = nullptr;
 HWND g_hLblBcdStatus  = nullptr;
@@ -768,6 +776,9 @@ void LoadConfigFromIni() {
     g_cfg.extraSetArgs         = ReadIniStr(L"ExtraSetArgs", L"");
     g_cfg.autoApplyNetwork     = ReadIniInt(L"AutoApplyNetwork", 1) != 0;
     g_cfg.exportNicDrivers     = ReadIniInt(L"ExportNicDrivers", 1) != 0;
+    g_cfg.remoteSupportEnable  = ReadIniInt(L"RemoteSupportEnable", 0) != 0;
+    g_cfg.remoteSupportCode    = ReadIniStr(L"RemoteSupportCode", L"");
+    g_cfg.remoteSupportExe     = ReadIniStr(L"RemoteSupportExe", L"ManualLauncher.exe");
     g_cfg.importPatchDriveFix  = ReadIniInt(L"ImportPatchDriveFix", 1) != 0;
     g_cfg.patchedWimPath       = ReadIniStr(L"PatchedWimPath", L"");
     g_cfg.patchedWimSig        = ReadIniStr(L"PatchedWimSig", L"");
@@ -828,6 +839,10 @@ void PullControlsToConfig() {
     g_cfg.extraSetArgs     = Trim(GetWndText(g_hEdtExtra));
     g_cfg.autoApplyNetwork = (SendMessageW(g_hChkAutoNet, BM_GETCHECK, 0, 0) == BST_CHECKED);
     g_cfg.exportNicDrivers = (SendMessageW(g_hChkExportDrv, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_cfg.remoteSupportEnable = (SendMessageW(g_hChkRemoteSupport, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    g_cfg.remoteSupportCode   = Trim(GetWndText(g_hEdtRemoteCode));
+    g_cfg.remoteSupportExe    = Trim(GetWndText(g_hEdtRemoteExe));
+    if (g_cfg.remoteSupportExe.empty()) g_cfg.remoteSupportExe = L"ManualLauncher.exe";
 }
 
 bool SaveConfigToIni(bool logSaved = true) {
@@ -851,6 +866,9 @@ bool SaveConfigToIni(bool logSaved = true) {
     WriteIniStr(L"ExtraSetArgs", g_cfg.extraSetArgs);
     WriteIniStr(L"AutoApplyNetwork", g_cfg.autoApplyNetwork ? L"1" : L"0");
     WriteIniStr(L"ExportNicDrivers", g_cfg.exportNicDrivers ? L"1" : L"0");
+    WriteIniStr(L"RemoteSupportEnable", g_cfg.remoteSupportEnable ? L"1" : L"0");
+    WriteIniStr(L"RemoteSupportCode", g_cfg.remoteSupportCode);
+    WriteIniStr(L"RemoteSupportExe", g_cfg.remoteSupportExe);
     WriteIniStr(L"ImportPatchDriveFix", g_cfg.importPatchDriveFix ? L"1" : L"0");
     WriteIniStr(L"PatchedWimPath", g_cfg.patchedWimPath);
     WriteIniStr(L"PatchedWimSig", g_cfg.patchedWimSig);
@@ -1167,7 +1185,10 @@ void SyncDriveMapAndBridgeForPe(const std::wstring& targetWimPath = L"") {
     }
     std::wstring relAppDir = GetNormalizedBcdRelativeDir(exportBaseDir);
     net_sync::ExportDriveMapForPe(relAppDir, g_cfg.autoApplyNetwork,
-                                  [](const std::wstring& m) { AppendLog(m); });
+                                  [](const std::wstring& m) { AppendLog(m); },
+                                  g_cfg.remoteSupportEnable,
+                                  g_cfg.remoteSupportCode,
+                                  g_cfg.remoteSupportExe);
 }
 
 void StartAsyncWimPatch(PostPatchFollowUp followUp) {
@@ -2808,13 +2829,18 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
                      L")가 선택되어 있습니다. 부팅이 차단될 경우 Win11 PE를 쓰거나 BIOS에서 Secure Boot를 꺼주세요.\n";
         }
         bool wimPatched = IsWimCurrentlyPatched(wimInfo);
-        wchar_t confirmMsg[1280];
+        std::wstring remoteNote;
+        if (g_cfg.remoteSupportEnable && !g_cfg.remoteSupportCode.empty()) {
+            remoteNote = L"\n• 원격지원(애니서포트): 자동 연결 활성화 (인증번호: " + g_cfg.remoteSupportCode +
+                         L", 대상: " + g_cfg.remoteSupportExe + L")";
+        }
+        wchar_t confirmMsg[1500];
         swprintf_s(confirmMsg,
                    L"설정을 저장하고 다음 1회 재부팅을 WinPE로 예약한 뒤 %d초 후 재부팅합니다.\n\n"
                    L"• WIM: %s\n"
                    L"• 로더: %s\n"
                    L"• 드라이브(C:) 자동 복구: %s\n"
-                   L"• 네트워크 무인 적용: %s\n%s\n"
+                   L"• 네트워크 무인 적용: %s%s\n%s\n"
                    L"PE에서 작업 완료 후 재부팅하면 자동으로 기존 Windows로 복귀합니다.\n"
                    L"지금 재부팅하시겠습니까?",
                    g_cfg.rebootDelaySec,
@@ -2822,6 +2848,7 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
                    g_cfg.loaderPath.c_str(),
                    wimPatched ? L"활성화됨 (패치 적용됨)" : L"미적용",
                    g_cfg.autoApplyNetwork ? L"활성화됨 (드라이버 및 IP/DNS/Wi-Fi 동기화)" : L"비활성",
+                   remoteNote.c_str(),
                    sbNote.c_str());
         if (MessageBoxW(g_hMainWnd, confirmMsg, L"1회성 WinPE 부팅 실행 확인",
                         MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES) {
@@ -2839,9 +2866,8 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
         bool useCacheExport = !wimParentDir.empty() &&
                               (ToLower(wimParentDir).find(L"onetimepe_cache") != std::wstring::npos);
         ActionSyncWindowsNetworkNow(false, useCacheExport ? wimParentDir : L"");
-    } else {
-        SyncDriveMapAndBridgeForPe(wimInfo.fullPath);
     }
+    SyncDriveMapAndBridgeForPe(wimInfo.fullPath);
 
     // Suspend BitLocker BEFORE modifying BCD so protectors/PCR state and Clear Key are cleanly prepared
     if (!HandleBitLockerBeforeBoot(wimInfo, sdiInfo)) return;
@@ -2951,6 +2977,7 @@ void ApplyFontsToControls() {
         g_hChkBitLocker, g_hLblBlCount, g_hEdtBlCount, g_hLblRebootSec, g_hEdtRebootSec,
         g_hLblExtra, g_hEdtExtra,
         g_hChkAutoNet, g_hChkExportDrv, g_hBtnSyncNet, g_hBtnPatchWim,
+        g_hLblRemoteCode, g_hLblRemoteExe, g_hEdtRemoteExe,
         g_hLblBcdStatus, g_hBtnRefreshBcd,
         g_hBtnSaveCfg, g_hBtnApplyBcd, g_hBtnQueueOnly, g_hBtnCleanBcd, g_hBtnClearLog
     };
@@ -2960,7 +2987,8 @@ void ApplyFontsToControls() {
 
     const HWND boldCtrls[] = {
         g_hGrpFiles, g_hGrpVars, g_hGrpNet, g_hGrpActions, g_hGrpLog,
-        g_hBtnImportCustom, g_hLblSecStatus, g_hLblNetStatus, g_hBtnBootNow
+        g_hBtnImportCustom, g_hLblSecStatus, g_hLblNetStatus,
+        g_hChkRemoteSupport, g_hEdtRemoteCode, g_hBtnBootNow
     };
     for (HWND h : boldCtrls) {
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFontBold), TRUE);
@@ -3069,9 +3097,9 @@ void LayoutControls(int clientW, int clientH) {
     place(g_hLblExtra, inX, vr6Y + Scale(3), labelW, Scale(20));
     place(g_hEdtExtra, inX + labelW, vr6Y, inW - labelW, rowH);
 
-    // Group 3: PE Auto-Network & Unattended WIM Patch
+    // Group 3: PE Auto-Network & Remote Support & Unattended WIM Patch
     int g3Y = g2Y + g2H + Scale(7);
-    int g3H = Scale(84);
+    int g3H = Scale(114);
     place(g_hGrpNet, margin, g3Y, contentW, g3H);
 
     int nr1Y = g3Y + Scale(22);
@@ -3084,6 +3112,26 @@ void LayoutControls(int clientW, int clientH) {
     place(g_hChkExportDrv, inX + Scale(244), nr2Y + Scale(2), Scale(188), Scale(22));
     place(g_hBtnSyncNet, inX + inW - netBtnW1 - netBtnW2 - btnGap, nr2Y - Scale(1), netBtnW1, Scale(25));
     place(g_hBtnPatchWim, inX + inW - netBtnW2, nr2Y - Scale(1), netBtnW2, Scale(25));
+
+    int nr3Y = nr2Y + Scale(29);
+    int chkRemoteW = Scale(270);
+    place(g_hChkRemoteSupport, inX, nr3Y + Scale(2), chkRemoteW, Scale(22));
+
+    int codeLblX = inX + chkRemoteW + Scale(6);
+    int codeLblW = Scale(62);
+    place(g_hLblRemoteCode, codeLblX, nr3Y + Scale(3), codeLblW, Scale(20));
+
+    int codeEdtX = codeLblX + codeLblW;
+    int codeEdtW = Scale(110);
+    place(g_hEdtRemoteCode, codeEdtX, nr3Y, codeEdtW, rowH);
+
+    int exeLblX = codeEdtX + codeEdtW + Scale(10);
+    int exeLblW = Scale(62);
+    place(g_hLblRemoteExe, exeLblX, nr3Y + Scale(3), exeLblW, Scale(20));
+
+    int exeEdtX = exeLblX + exeLblW;
+    int exeEdtW = std::max(Scale(120), inX + inW - exeEdtX);
+    place(g_hEdtRemoteExe, exeEdtX, nr3Y, exeEdtW, rowH);
 
     // Group 4: BCD Status & Actions
     int g4Y = g3Y + g3H + Scale(7);
@@ -3161,6 +3209,13 @@ void PopulateInitialValues() {
     SendMessageW(g_hChkAutoNet, BM_SETCHECK, g_cfg.autoApplyNetwork ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(g_hChkExportDrv, BM_SETCHECK, g_cfg.exportNicDrivers ? BST_CHECKED : BST_UNCHECKED, 0);
 
+    // 원격지원 (애니서포트) 초기값 반영
+    SendMessageW(g_hChkRemoteSupport, BM_SETCHECK, g_cfg.remoteSupportEnable ? BST_CHECKED : BST_UNCHECKED, 0);
+    SetWindowTextW(g_hEdtRemoteCode, g_cfg.remoteSupportCode.c_str());
+    SetWindowTextW(g_hEdtRemoteExe, g_cfg.remoteSupportExe.c_str());
+    SendMessageW(g_hEdtRemoteCode, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"예: 123456"));
+    SendMessageW(g_hEdtRemoteExe, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"ManualLauncher.exe"));
+
     ScanLocalPeFiles(false);
     RefreshBcdStatusUI();
 
@@ -3203,7 +3258,7 @@ void CreateAllControls(HWND hWnd) {
                                0, 0, 10, 10, hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_hInst, nullptr);
     };
 
-    g_hLblTitle   = mkStatic(L"OneTimePE v1.3 - 1회성 내장 WinPE & 커스텀PE 매니저", SS_LEFT, IDC_LBL_TITLE);
+    g_hLblTitle   = mkStatic(L"OneTimePE v1.4 - 1회성 내장 WinPE & 커스텀PE 매니저", SS_LEFT, IDC_LBL_TITLE);
     g_hLblSysInfo = mkStatic(L"", SS_RIGHT, IDC_LBL_SYSINFO);
 
     // Group 1
@@ -3253,13 +3308,19 @@ void CreateAllControls(HWND hWnd) {
     g_hLblExtra      = mkStatic(L"추가 변수:", SS_LEFT);
     g_hEdtExtra      = mkEdit(IDC_EDT_EXTRA_SET);
 
-    // Group 3: Drive Letter (C:) Auto-Fix & Unattended Network WIM Patch
-    g_hGrpNet        = mkGroup(L"3. PE 부팅 후 드라이브 문자(C:) 자동 복구 & 무인 네트워크 연결 (WIM 패치)");
+    // Group 3: Drive Letter (C:) Auto-Fix & Network & AnySupport (Remote Support)
+    g_hGrpNet        = mkGroup(L"3. PE 부팅 후 드라이브 문자(C:) 복구 & 무인 네트워크 및 원격지원(애니서포트) 연결");
     g_hLblNetStatus  = mkStatic(L"", SS_LEFT | SS_ENDELLIPSIS, IDC_LBL_NETSTATUS);
     g_hChkAutoNet    = mkCheck(L"PE 부팅 시 현재 네트워크 자동 적용", IDC_CHK_AUTONET);
     g_hChkExportDrv  = mkCheck(L"랜카드 드라이버(.inf) 함께 추출", IDC_CHK_EXPORT_DRV);
     g_hBtnSyncNet    = mkBtn(L"네트워크 확인/추출", IDC_BTN_SYNC_NET);
     g_hBtnPatchWim   = mkBtn(L"WIM 자동복구 패치", IDC_BTN_PATCH_WIM);
+
+    g_hChkRemoteSupport = mkCheck(L"PE 부팅 후 애니서포트(원격지원) 자동 연결", IDC_CHK_REMOTE_SUPPORT);
+    g_hLblRemoteCode    = mkStatic(L"인증번호:", SS_LEFT);
+    g_hEdtRemoteCode    = mkEdit(IDC_EDT_REMOTE_CODE, ES_AUTOHSCROLL | ES_CENTER);
+    g_hLblRemoteExe     = mkStatic(L"실행파일:", SS_LEFT);
+    g_hEdtRemoteExe     = mkEdit(IDC_EDT_REMOTE_EXE, ES_AUTOHSCROLL);
 
     // Group 4: BCD Status & Actions
     g_hGrpActions    = mkGroup(L"4. BCD 상태 및 1회성 부팅 실행");
@@ -3454,7 +3515,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         case WM_GETMINMAXINFO: {
             auto* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
             mmi->ptMinTrackSize.x = Scale(720);
-            mmi->ptMinTrackSize.y = Scale(730);
+            mmi->ptMinTrackSize.y = Scale(750);
             return 0;
         }
 
@@ -3677,7 +3738,7 @@ void InitPathsAndEnv() {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdShow) {
     InitAppDirOnly();
 
-    // Silent unattended boot-init / C: drive letter fix / network setup modes inside WinPE
+    // Silent unattended boot-init / C: drive letter fix / network setup / remote support modes inside WinPE
     if (lpCmdLine) {
         if (wcsstr(lpCmdLine, L"--pe-boot-init") != nullptr) {
             return net_sync::RunPeBootInitMode(g_appDir);
@@ -3688,6 +3749,39 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
         if (wcsstr(lpCmdLine, L"--pe-apply-net") != nullptr) {
             net_sync::RunPeFixDrivesMode();
             return net_sync::RunPeAutoNetMode(g_appDir);
+        }
+        if (const wchar_t* pRem = wcsstr(lpCmdLine, L"--pe-remote-support")) {
+            std::wstring code;
+            std::wstring exe = L"ManualLauncher.exe";
+            const wchar_t* arg = pRem + wcslen(L"--pe-remote-support");
+            while (*arg == L' ') arg++;
+            if (*arg) {
+                const wchar_t* endToken = wcschr(arg, L' ');
+                if (endToken) {
+                    code = std::wstring(arg, endToken - arg);
+                    const wchar_t* exeArg = endToken + 1;
+                    while (*exeArg == L' ') exeArg++;
+                    if (*exeArg) exe = exeArg;
+                } else {
+                    code = arg;
+                }
+            } else {
+                for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
+                    if (drv == L'X') continue;
+                    std::wstring candIni = std::wstring(1, drv) + L":\\Windows\\Temp\\OneTimePE_Bridge.ini";
+                    if (GetFileAttributesW(candIni.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        wchar_t cBuf[128]{};
+                        GetPrivateProfileStringW(L"RemoteSupport", L"Code", L"", cBuf, _countof(cBuf), candIni.c_str());
+                        wchar_t eBuf[MAX_PATH]{};
+                        GetPrivateProfileStringW(L"RemoteSupport", L"ExeName", L"ManualLauncher.exe", eBuf, _countof(eBuf), candIni.c_str());
+                        code = Trim(cBuf);
+                        std::wstring candExe = Trim(eBuf);
+                        if (!candExe.empty()) exe = candExe;
+                        break;
+                    }
+                }
+            }
+            return net_sync::RunPeRemoteSupportMode(code, exe);
         }
     }
 
@@ -3734,7 +3828,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
     int maxWorkH = (workArea.bottom > workArea.top) ? (workArea.bottom - workArea.top - 16) : 900;
 
     int initW = Scale(780);
-    int initH = std::min(Scale(795), maxWorkH);
+    int initH = std::min(Scale(825), maxWorkH);
     int posX  = std::max<int>(workArea.left, workArea.left + ((workArea.right - workArea.left) - initW) / 2);
     int posY  = std::max<int>(workArea.top, workArea.top + ((workArea.bottom - workArea.top) - initH) / 2);
 
