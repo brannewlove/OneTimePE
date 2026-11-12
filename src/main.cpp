@@ -3745,12 +3745,32 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
             net_sync::RunPeFixDrivesMode();
             return net_sync::RunPeAutoNetMode(g_appDir);
         }
-        if (const wchar_t* pRem = wcsstr(lpCmdLine, L"--pe-remote-support")) {
-            std::wstring code;
-            std::wstring exe = L"ManualLauncher.exe";
-            const wchar_t* arg = pRem + wcslen(L"--pe-remote-support");
-            while (*arg == L' ') arg++;
-            if (*arg) {
+        const wchar_t* pRem = wcsstr(lpCmdLine, L"--pe-remote-support");
+        if (!pRem) pRem = wcsstr(lpCmdLine, L"-pe-remote-support");
+        if (!pRem) pRem = wcsstr(lpCmdLine, L"/pe-remote-support");
+        if (!pRem) pRem = wcsstr(lpCmdLine, L"--remote-support");
+        if (!pRem) pRem = wcsstr(lpCmdLine, L"-remote");
+        if (!pRem) pRem = wcsstr(lpCmdLine, L"/remote");
+
+        std::wstring code;
+        std::wstring exe = L"ManualLauncher.exe";
+
+        if (pRem) {
+            const wchar_t* arg = pRem;
+            while (*arg && *arg != L' ' && *arg != L'=') arg++;
+            while (*arg == L' ' || *arg == L'=' || *arg == L':') arg++;
+            if (*arg == L'"') {
+                arg++;
+                const wchar_t* endQ = wcschr(arg, L'"');
+                if (endQ) {
+                    code = std::wstring(arg, endQ - arg);
+                    const wchar_t* exeArg = endQ + 1;
+                    while (*exeArg == L' ') exeArg++;
+                    if (*exeArg) exe = exeArg;
+                } else {
+                    code = arg;
+                }
+            } else if (*arg) {
                 const wchar_t* endToken = wcschr(arg, L' ');
                 if (endToken) {
                     code = std::wstring(arg, endToken - arg);
@@ -3760,7 +3780,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
                 } else {
                     code = arg;
                 }
-            } else {
+            }
+        } else {
+            // Check if command line is directly an authentication passcode (all digits, 4~8 characters)
+            std::wstring cmdTrim = Trim(lpCmdLine);
+            bool isAllDigits = !cmdTrim.empty();
+            for (wchar_t ch : cmdTrim) {
+                if (ch < L'0' || ch > L'9') { isAllDigits = false; break; }
+            }
+            if (isAllDigits && cmdTrim.size() >= 4 && cmdTrim.size() <= 8) {
+                code = cmdTrim;
+                pRem = lpCmdLine;
+            }
+        }
+
+        if (pRem) {
+            code = Trim(code);
+            if (code.empty()) {
                 for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
                     if (drv == L'X') continue;
                     std::wstring candIni = std::wstring(1, drv) + L":\\Windows\\Temp\\OneTimePE_Bridge.ini";
@@ -3776,7 +3812,31 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR lpCmdLine, int nCmdSho
                     }
                 }
             }
-            return net_sync::RunPeRemoteSupportMode(code, exe);
+            if (!code.empty()) {
+                return net_sync::RunPeRemoteSupportMode(code, exe);
+            }
+        }
+    }
+
+    // Fallback: If running inside WinPE without arguments, check if RemoteSupport is configured in bridge INI
+    if (GetFileAttributesW(L"X:\\Windows\\System32") != INVALID_FILE_ATTRIBUTES) {
+        for (wchar_t drv = L'C'; drv <= L'Z'; ++drv) {
+            if (drv == L'X') continue;
+            std::wstring candIni = std::wstring(1, drv) + L":\\Windows\\Temp\\OneTimePE_Bridge.ini";
+            if (GetFileAttributesW(candIni.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                if (GetPrivateProfileIntW(L"RemoteSupport", L"Enable", 0, candIni.c_str()) == 1) {
+                    wchar_t cBuf[128]{};
+                    GetPrivateProfileStringW(L"RemoteSupport", L"Code", L"", cBuf, _countof(cBuf), candIni.c_str());
+                    wchar_t eBuf[MAX_PATH]{};
+                    GetPrivateProfileStringW(L"RemoteSupport", L"ExeName", L"ManualLauncher.exe", eBuf, _countof(eBuf), candIni.c_str());
+                    std::wstring peCode = Trim(cBuf);
+                    std::wstring peExe = Trim(eBuf);
+                    if (!peCode.empty()) {
+                        return net_sync::RunPeRemoteSupportMode(peCode, peExe.empty() ? L"ManualLauncher.exe" : peExe);
+                    }
+                }
+                break;
+            }
         }
     }
 

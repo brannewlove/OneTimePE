@@ -4298,17 +4298,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         SetForegroundWindow(hWndTarget);
         SetActiveWindow(hWndTarget);
         SendMessageW(hWndTarget, WM_ACTIVATE, WA_ACTIVE, 0);
-
-        // Hardware mouse click near top-left of target window to guarantee OS activation and clear any menu state
-        RECT rcWnd{};
-        GetWindowRect(hWndTarget, &rcWnd);
-        int clickX = rcWnd.left + 50;
-        int clickY = rcWnd.top + 10;
-        SetCursorPos(clickX, clickY);
-        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-        Sleep(20);
-        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-        Sleep(80);
+        Sleep(100);
     };
 
     // 5. Structure to hold all enumerated child controls
@@ -4432,40 +4422,50 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         }
         if (cleanCode.empty()) cleanCode = Trim(code);
 
-        // Step B & C: Focus, Click, and Input the Authentication Code
+        // Step B: Focus the edit box and click it directly
         if (hTargetEdit && IsWindow(hTargetEdit)) {
-            logRemote(L"인증번호 입력란 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hTargetEdit)) + L") -> 직접 포커스 및 하드웨어 마우스 클릭");
+            logRemote(L"인증번호 입력란 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hTargetEdit)) + L") -> 직접 포커스 및 캐럿 활성화");
             SetFocus(hTargetEdit);
             SendMessageW(hTargetEdit, WM_SETFOCUS, 0, 0);
 
-            // Physically click the center of the edit box to set the cursor and guarantee activation
+            // Click center of edit box to set the cursor
             RECT rcEdit{};
-            GetWindowRect(hTargetEdit, &rcEdit);
-            int sx = rcEdit.left + (rcEdit.right - rcEdit.left) / 2;
-            int sy = rcEdit.top + (rcEdit.bottom - rcEdit.top) / 2;
-            SetCursorPos(sx, sy);
-            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-            Sleep(30);
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            Sleep(60);
+            GetClientRect(hTargetEdit, &rcEdit);
+            int cx = (rcEdit.right - rcEdit.left) / 2;
+            int cy = (rcEdit.bottom - rcEdit.top) / 2;
+            SendMessageW(hTargetEdit, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
+            SendMessageW(hTargetEdit, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
 
-            // Clear any existing text via Win32 messages
+            RECT rcScreen{};
+            GetWindowRect(hTargetEdit, &rcScreen);
+            int scx = rcScreen.left + (rcScreen.right - rcScreen.left) / 2;
+            int scy = rcScreen.top + (rcScreen.bottom - rcScreen.top) / 2;
+            SetCursorPos(scx, scy);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            Sleep(25);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            Sleep(50);
+        }
+
+        // Step C: Clear the box completely using Keyboard (Select All + Backspace)
+        sendCtrlKey('A');
+        sendKeyTap(VK_BACK, 25, 30);
+        if (hTargetEdit && IsWindow(hTargetEdit)) {
             SendMessageW(hTargetEdit, EM_SETSEL, 0, -1);
             SendMessageW(hTargetEdit, WM_CLEAR, 0, 0);
             SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L""));
+        }
+        Sleep(50);
 
-            // Set the exact authentication code directly (guaranteed exact length without doubling!)
-            SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(cleanCode.c_str()));
+        // Step D: Type the code via PURE HARDWARE KEYBOARD (SendInput)
+        logRemote(L"순수 키보드(SendInput)로 인증번호 [" + cleanCode + L"] 타이핑 전송 (길이: " +
+                  std::to_wstring(cleanCode.size()) + L")");
+        typeStringViaKeyboard(cleanCode);
+        Sleep(120);
+
+        if (hTargetEdit && IsWindow(hTargetEdit)) {
             SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_CHANGE), reinterpret_cast<LPARAM>(hTargetEdit));
             SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_UPDATE), reinterpret_cast<LPARAM>(hTargetEdit));
-            logRemote(L"인증번호 WM_SETTEXT 주입 완료: [" + cleanCode + L"] (길이: " +
-                      std::to_wstring(cleanCode.size()) + L")");
-        } else {
-            // Fallback for custom canvas or DirectUI controls
-            logRemote(L"표준 Edit 컨트롤 미발견 -> 하드웨어 SendInput 키보드 타이핑 실행");
-            sendCtrlKey('A');
-            sendKeyTap(VK_BACK, 20, 25);
-            typeStringViaKeyboard(cleanCode);
         }
         Sleep(100);
 
