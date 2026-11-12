@@ -4035,7 +4035,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             GetWindowRect(hWnd, &rc);
             int w = rc.right - rc.left;
             int h = rc.bottom - rc.top;
-            if (w < 180 || h < 100) return TRUE;
+            if (w < 100 || h < 60) return TRUE;
 
             wchar_t clsBuf[128]{};
             GetClassNameW(hWnd, clsBuf, _countof(clsBuf));
@@ -4056,6 +4056,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             HWND hPopup = GetLastActivePopup(hWnd);
             if (hPopup && hPopup != hWnd && IsWindowVisible(hPopup) && !IsIconic(hPopup)) {
                 hWnd = hPopup;
+                GetWindowThreadProcessId(hWnd, &pid);
                 GetWindowTextW(hWnd, titleBuf, _countof(titleBuf));
                 title = ToLower(titleBuf);
                 GetClassNameW(hWnd, clsBuf, _countof(clsBuf));
@@ -4073,7 +4074,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             if (pCtx->pids) {
                 for (DWORD p : *(pCtx->pids)) {
                     if (p != 0 && p == pid) {
-                        score += 120;
+                        score += 250;
                         break;
                     }
                 }
@@ -4087,7 +4088,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
                 if (QueryFullProcessImageNameW(hProc, 0, imgPath, &imgSize)) {
                     std::wstring fn = ToLower(FileNameFromPath(imgPath));
                     if (fn == L"manuallauncher.exe" || fn.find(L"anysupport") != std::wstring::npos) {
-                        score += 100;
+                        score += 250;
                     }
                 }
                 CloseHandle(hProc);
@@ -4212,40 +4213,71 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
 
     // 4. Forceful Window Selection Helper:
     //    Demotes any obstructing top windows to HWND_BOTTOM and elevates hTargetWnd to HWND_TOPMOST
-    //    WITHOUT sending random WM_NEXTDLGCTL or SetFocus calls that disrupt input controls!
-    auto forceSelectWindow = [&](HWND hWndTarget) {
+    //    NEVER demotes windows belonging to the target process!
+    auto forceSelectWindow = [&](HWND hWndTarget, const std::vector<DWORD>& targetPids) {
         if (!IsWindow(hWndTarget)) return;
 
-        // A. Demote any other window currently sitting in the foreground or topmost
+        DWORD tgtPid = 0;
+        DWORD tgtThreadId = GetWindowThreadProcessId(hWndTarget, &tgtPid);
+
+        auto isTargetPid = [&](DWORD pid) -> bool {
+            if (pid == tgtPid) return true;
+            for (DWORD p : targetPids) {
+                if (p != 0 && p == pid) return true;
+            }
+            return false;
+        };
+
+        // A. Demote other obstructing windows to HWND_BOTTOM
+        // BUT NEVER demote windows belonging to the target process!
         HWND hFg = GetForegroundWindow();
         if (hFg && hFg != hWndTarget) {
-            wchar_t fgTitle[128]{};
-            wchar_t fgCls[128]{};
-            GetWindowTextW(hFg, fgTitle, _countof(fgTitle));
-            GetClassNameW(hFg, fgCls, _countof(fgCls));
-            if (_wcsicmp(fgCls, L"Shell_TrayWnd") != 0 && _wcsicmp(fgCls, L"Progman") != 0) {
-                logRemote(L"상위 가로막음 창 감지 -> 후면(HWND_BOTTOM) 이동: [" +
-                          std::wstring(fgTitle) + L" / " + std::wstring(fgCls) + L"]");
-                SetWindowPos(hFg, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                SetWindowPos(hFg, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            DWORD fgPid = 0;
+            GetWindowThreadProcessId(hFg, &fgPid);
+            if (!isTargetPid(fgPid)) {
+                wchar_t fgTitle[128]{};
+                wchar_t fgCls[128]{};
+                GetWindowTextW(hFg, fgTitle, _countof(fgTitle));
+                GetClassNameW(hFg, fgCls, _countof(fgCls));
+                if (_wcsicmp(fgCls, L"Shell_TrayWnd") != 0 && _wcsicmp(fgCls, L"Progman") != 0) {
+                    logRemote(L"상위 방해 창 감지 -> 후면(HWND_BOTTOM) 이동: [" +
+                              std::wstring(fgTitle) + L" / " + std::wstring(fgCls) + L"]");
+                    SetWindowPos(hFg, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SetWindowPos(hFg, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
         }
 
-        // Demote all other visible topmost windows
+        // Demote all other visible topmost windows (except target PID and taskbar)
+        struct DemoteCtx {
+            HWND targetWnd;
+            DWORD tgtPid;
+            const std::vector<DWORD>* pids;
+        } dctx{ hWndTarget, tgtPid, &targetPids };
+
         EnumWindows([](HWND hTop, LPARAM lp) -> BOOL {
-            HWND hTarget = reinterpret_cast<HWND>(lp);
-            if (hTop == hTarget || !IsWindowVisible(hTop)) return TRUE;
+            auto* p = reinterpret_cast<DemoteCtx*>(lp);
+            if (hTop == p->targetWnd || !IsWindowVisible(hTop)) return TRUE;
+            DWORD topPid = 0;
+            GetWindowThreadProcessId(hTop, &topPid);
+            if (topPid == p->tgtPid) return TRUE;
+            if (p->pids) {
+                for (DWORD pid : *(p->pids)) {
+                    if (pid != 0 && pid == topPid) return TRUE;
+                }
+            }
+
             LONG exStyle = GetWindowLongW(hTop, GWL_EXSTYLE);
             if (exStyle & WS_EX_TOPMOST) {
                 wchar_t cBuf[128]{};
                 GetClassNameW(hTop, cBuf, _countof(cBuf));
-                if (_wcsicmp(cBuf, L"Shell_TrayWnd") != 0) {
+                if (_wcsicmp(cBuf, L"Shell_TrayWnd") != 0 && _wcsicmp(cBuf, L"Progman") != 0) {
                     SetWindowPos(hTop, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     SetWindowPos(hTop, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             }
             return TRUE;
-        }, reinterpret_cast<LPARAM>(hWndTarget));
+        }, reinterpret_cast<LPARAM>(&dctx));
 
         SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, nullptr, SPIF_SENDCHANGE);
         AllowSetForegroundWindow(ASFW_ANY);
@@ -4258,30 +4290,25 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         SetWindowPos(hWndTarget, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
 
         DWORD curThreadId = GetCurrentThreadId();
-        DWORD fgThreadId  = hFg ? GetWindowThreadProcessId(hFg, nullptr) : 0;
-        DWORD tgtThreadId = GetWindowThreadProcessId(hWndTarget, nullptr);
-
-        bool attachedFg  = false;
-        bool attachedTgt = false;
-        if (fgThreadId != 0 && fgThreadId != curThreadId) {
-            attachedFg = (AttachThreadInput(curThreadId, fgThreadId, TRUE) != FALSE);
+        if (tgtThreadId != 0 && tgtThreadId != curThreadId) {
+            AttachThreadInput(curThreadId, tgtThreadId, TRUE);
         }
-        if (tgtThreadId != 0 && tgtThreadId != curThreadId && tgtThreadId != fgThreadId) {
-            attachedTgt = (AttachThreadInput(curThreadId, tgtThreadId, TRUE) != FALSE);
-        }
-
-        // Alt key state unlock for SetForegroundWindow
-        keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0);
-        keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
 
         BringWindowToTop(hWndTarget);
         SetForegroundWindow(hWndTarget);
         SetActiveWindow(hWndTarget);
         SendMessageW(hWndTarget, WM_ACTIVATE, WA_ACTIVE, 0);
 
-        if (attachedTgt) AttachThreadInput(curThreadId, tgtThreadId, FALSE);
-        if (attachedFg)  AttachThreadInput(curThreadId, fgThreadId, FALSE);
-        Sleep(150);
+        // Hardware mouse click near top-left of target window to guarantee OS activation and clear any menu state
+        RECT rcWnd{};
+        GetWindowRect(hWndTarget, &rcWnd);
+        int clickX = rcWnd.left + 50;
+        int clickY = rcWnd.top + 10;
+        SetCursorPos(clickX, clickY);
+        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        Sleep(20);
+        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        Sleep(80);
     };
 
     // 5. Structure to hold all enumerated child controls
@@ -4301,10 +4328,12 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             break;
         }
 
-        logRemote(L"--- 키보드 입력 및 연결 시도 (Pass " + std::to_wstring(pass) + L"/3) ---");
+        logRemote(L"--- 원격지원 창 활성화 및 자동 연결 시도 (Pass " + std::to_wstring(pass) + L"/3) ---");
+
+        std::vector<DWORD> pids = findTargetPids(targetExe);
 
         // Step A: Elevate window to topmost foreground
-        forceSelectWindow(hTargetWnd);
+        forceSelectWindow(hTargetWnd, pids);
         logRemote(L"창 최상위 선택 완료 (Foreground=" +
                   std::to_wstring(reinterpret_cast<uintptr_t>(GetForegroundWindow())) + L")");
 
@@ -4336,7 +4365,7 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             // Search for single-line editable input control
             if (c.cls.find(L"edit") != std::wstring::npos) {
                 LONG style = GetWindowLongW(c.hWnd, GWL_STYLE);
-                if (!(style & ES_READONLY) && c.h >= 14 && c.h <= 60 && c.w >= 30) {
+                if (!(style & ES_READONLY) && c.h >= 12 && c.h <= 70 && c.w >= 25) {
                     // Prefer currently focused control or first valid edit
                     if (!hTargetEdit || GetFocus() == c.hWnd) {
                         hTargetEdit = c.hWnd;
@@ -4370,6 +4399,32 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             }
         }
 
+        // Positional button fallback for Owner-Drawn / Image buttons without text
+        if (!hBtnConnect && hTargetEdit) {
+            RECT rcEdit{};
+            GetWindowRect(hTargetEdit, &rcEdit);
+            for (const auto& c : children) {
+                if (!IsWindowVisible(c.hWnd) || !IsWindowEnabled(c.hWnd)) continue;
+                if (c.cls.find(L"button") == std::wstring::npos) continue;
+                if (c.id == IDCANCEL || c.id == 2) continue;
+                std::wstring lowT = ToLower(c.text);
+                if (lowT.find(L"취소") != std::wstring::npos || lowT.find(L"닫기") != std::wstring::npos ||
+                    lowT.find(L"cancel") != std::wstring::npos || lowT.find(L"close") != std::wstring::npos) continue;
+
+                // Button directly to the right or below edit box
+                bool isRight = (c.rc.left >= rcEdit.right - 15 && c.rc.left <= rcEdit.right + 150 &&
+                                c.rc.top >= rcEdit.top - 25 && c.rc.bottom <= rcEdit.bottom + 25);
+                bool isBelow = (c.rc.top >= rcEdit.bottom - 5 && c.rc.top <= rcEdit.bottom + 70 &&
+                                c.w >= 35 && c.h >= 18);
+                if (isRight || isBelow) {
+                    hBtnConnect = c.hWnd;
+                    logRemote(L"위치 기반 연결 버튼 식별: cls=[" + c.cls + L"], id=" +
+                              std::to_wstring(c.id) + L", w=" + std::to_wstring(c.w) + L", h=" + std::to_wstring(c.h));
+                    break;
+                }
+            }
+        }
+
         // Clean and prepare authentication code (strip spaces/symbols)
         std::wstring cleanCode;
         for (wchar_t ch : code) {
@@ -4377,68 +4432,46 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         }
         if (cleanCode.empty()) cleanCode = Trim(code);
 
-        // Step B: Focus the passcode input field cleanly and thoroughly clear it
+        // Step B & C: Focus, Click, and Input the Authentication Code
         if (hTargetEdit && IsWindow(hTargetEdit)) {
-            logRemote(L"인증번호 입력 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hTargetEdit)) + L") -> 직접 포커스 및 캐럿 활성화");
+            logRemote(L"인증번호 입력란 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hTargetEdit)) + L") -> 직접 포커스 및 하드웨어 마우스 클릭");
             SetFocus(hTargetEdit);
+            SendMessageW(hTargetEdit, WM_SETFOCUS, 0, 0);
 
-            // Simulate left-click directly inside the center of the edit box to guarantee cursor placement
+            // Physically click the center of the edit box to set the cursor and guarantee activation
             RECT rcEdit{};
-            GetClientRect(hTargetEdit, &rcEdit);
-            int cx = (rcEdit.right - rcEdit.left) / 2;
-            int cy = (rcEdit.bottom - rcEdit.top) / 2;
-            SendMessageW(hTargetEdit, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(cx, cy));
-            SendMessageW(hTargetEdit, WM_LBUTTONUP, 0, MAKELPARAM(cx, cy));
-            Sleep(50);
+            GetWindowRect(hTargetEdit, &rcEdit);
+            int sx = rcEdit.left + (rcEdit.right - rcEdit.left) / 2;
+            int sy = rcEdit.top + (rcEdit.bottom - rcEdit.top) / 2;
+            SetCursorPos(sx, sy);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+            Sleep(60);
 
             // Clear any existing text via Win32 messages
             SendMessageW(hTargetEdit, EM_SETSEL, 0, -1);
             SendMessageW(hTargetEdit, WM_CLEAR, 0, 0);
             SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(L""));
+
+            // Set the exact authentication code directly (guaranteed exact length without doubling!)
+            SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(cleanCode.c_str()));
+            SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_CHANGE), reinterpret_cast<LPARAM>(hTargetEdit));
+            SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_UPDATE), reinterpret_cast<LPARAM>(hTargetEdit));
+            logRemote(L"인증번호 WM_SETTEXT 주입 완료: [" + cleanCode + L"] (길이: " +
+                      std::to_wstring(cleanCode.size()) + L")");
         } else {
-            logRemote(L"표준 Edit 컨트롤 미발견 (커스텀 스킨/DirectUI 창) -> 창 기본 포커스 유지");
+            // Fallback for custom canvas or DirectUI controls
+            logRemote(L"표준 Edit 컨트롤 미발견 -> 하드웨어 SendInput 키보드 타이핑 실행");
+            sendCtrlKey('A');
+            sendKeyTap(VK_BACK, 20, 25);
+            typeStringViaKeyboard(cleanCode);
         }
+        Sleep(100);
 
-        // Keyboard clear: Select all + Backspace/Delete multiple times to guarantee clean empty box
-        sendCtrlKey('A');
-        sendKeyTap(VK_BACK, 20, 25);
-        sendKeyTap(VK_DELETE, 20, 25);
-        for (int b = 0; b < 10; ++b) {
-            sendKeyTap(VK_BACK, 15, 20);
-            sendKeyTap(VK_DELETE, 15, 20);
-        }
-        Sleep(60);
-
-        // Step C: Input the authentication code EXACTLY ONCE via Keyboard
-        logRemote(L"키보드(SendInput)로 인증번호 [" + cleanCode + L"] 입력 시작 (글자수: " +
-                  std::to_wstring(cleanCode.size()) + L")");
-        typeStringViaKeyboard(cleanCode);
-        Sleep(150);
-
-        // Step D: Verify the entered text if Edit control is available
-        if (hTargetEdit && IsWindow(hTargetEdit)) {
-            wchar_t vBuf[128]{};
-            GetWindowTextW(hTargetEdit, vBuf, _countof(vBuf));
-            logRemote(L"입력란 텍스트 확인: 현재=[" + std::wstring(vBuf) + L"], 목표=[" + cleanCode + L"]");
-
-            if (wcscmp(vBuf, cleanCode.c_str()) != 0) {
-                // If keyboard typing produced empty, duplicate, or incorrect text,
-                // enforce the exact code directly via WM_SETTEXT without appending!
-                logRemote(L"텍스트 불일치 감지 -> WM_SETTEXT 로 정확한 인증번호 강제 재설정: [" + cleanCode + L"]");
-                SendMessageW(hTargetEdit, EM_SETSEL, 0, -1);
-                SendMessageW(hTargetEdit, WM_CLEAR, 0, 0);
-                SendMessageW(hTargetEdit, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(cleanCode.c_str()));
-                SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_CHANGE), reinterpret_cast<LPARAM>(hTargetEdit));
-                SendMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hTargetEdit), EN_UPDATE), reinterpret_cast<LPARAM>(hTargetEdit));
-
-                GetWindowTextW(hTargetEdit, vBuf, _countof(vBuf));
-                logRemote(L"최종 보정 후 텍스트: [" + std::wstring(vBuf) + L"]");
-            }
-        }
-
-        // Step E: Trigger Connect!
-        // 1) First and foremost: Press Enter (VK_RETURN) directly in the active input box
-        logRemote(L"1차 연결 실행: 입력창에서 Enter(VK_RETURN) 키 전송");
+        // Step D: Trigger Connect!
+        // 1) Press Enter (VK_RETURN) directly in the active input box
+        logRemote(L"1차 연결 실행: Enter(VK_RETURN) 키 전송");
         sendKeyTap(VK_RETURN, 50, 80);
         PostMessageW(hTargetWnd, WM_KEYDOWN, VK_RETURN, 0);
         PostMessageW(hTargetWnd, WM_KEYUP, VK_RETURN, 0);
@@ -4446,29 +4479,32 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             PostMessageW(hTargetEdit, WM_KEYDOWN, VK_RETURN, 0);
             PostMessageW(hTargetEdit, WM_KEYUP, VK_RETURN, 0);
         }
-        Sleep(700);
+        Sleep(350);
 
-        // 2) If a verified Connect button was identified and window is still open, click it directly
-        if (IsWindow(hTargetWnd) && IsWindowVisible(hTargetWnd) && hBtnConnect && IsWindow(hBtnConnect)) {
+        // 2) Click the Connect button via BM_CLICK + WM_COMMAND + Physical Hardware Mouse Click!
+        if (hBtnConnect && IsWindow(hBtnConnect)) {
             wchar_t btnTxt[64]{};
             GetWindowTextW(hBtnConnect, btnTxt, _countof(btnTxt));
-            logRemote(L"2차 연결 실행: 검증된 연결 버튼 [" + std::wstring(btnTxt) + L" (ID: " +
-                      std::to_wstring(GetDlgCtrlID(hBtnConnect)) + L")] 클릭 메시지 전송");
+            logRemote(L"2차 연결 실행: 연결 버튼 [" + std::wstring(btnTxt) + L" (ID: " +
+                      std::to_wstring(GetDlgCtrlID(hBtnConnect)) + L")] 클릭 전송");
             SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
             PostMessageW(hTargetWnd, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hBtnConnect), BN_CLICKED), reinterpret_cast<LPARAM>(hBtnConnect));
 
+            // Physical hardware mouse click directly on the button!
             RECT rcBtn{};
-            GetClientRect(hBtnConnect, &rcBtn);
-            int bx = (rcBtn.right - rcBtn.left) / 2;
-            int by = (rcBtn.bottom - rcBtn.top) / 2;
-            SendMessageW(hBtnConnect, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(bx, by));
-            SendMessageW(hBtnConnect, WM_LBUTTONUP, 0, MAKELPARAM(bx, by));
+            GetWindowRect(hBtnConnect, &rcBtn);
+            int bsx = rcBtn.left + (rcBtn.right - rcBtn.left) / 2;
+            int bsy = rcBtn.top + (rcBtn.bottom - rcBtn.top) / 2;
+            SetCursorPos(bsx, bsy);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
         }
 
-        // Wait and monitor connection progress (up to 15 seconds)
-        logRemote(L"원격 서버 연결 대기 및 상태 감시 중 (최대 15초)...");
+        // Wait and monitor connection progress (up to 12 seconds)
+        logRemote(L"원격 서버 연결 대기 및 상태 감시 중...");
         bool connected = false;
-        for (int w = 0; w < 30; ++w) {
+        for (int w = 0; w < 24; ++w) {
             Sleep(500);
             if (!IsWindow(hTargetWnd) || !IsWindowVisible(hTargetWnd)) {
                 logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력창 닫힘/전환 완료)!");
@@ -4480,11 +4516,19 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
                 connected = true;
                 break;
             }
-            if (w == 8) { // After 4 seconds of waiting, send Enter / Click once more as fallback without re-typing
-                logRemote(L"연결 지연 감지 -> Enter 및 연결 버튼 보조 재전송 (재타이핑 없음)");
+            if (w == 6) { // After 3 seconds, retry Enter & Click once
+                logRemote(L"연결 대기 중... Enter 및 연결 버튼 보조 클릭 재전송");
                 sendKeyTap(VK_RETURN, 50, 80);
                 if (hBtnConnect && IsWindow(hBtnConnect)) {
                     SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
+                    RECT rcBtn{};
+                    GetWindowRect(hBtnConnect, &rcBtn);
+                    int bsx = rcBtn.left + (rcBtn.right - rcBtn.left) / 2;
+                    int bsy = rcBtn.top + (rcBtn.bottom - rcBtn.top) / 2;
+                    SetCursorPos(bsx, bsy);
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    Sleep(30);
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
                 }
             }
         }
