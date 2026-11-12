@@ -51,7 +51,7 @@ OneTimePE/
 | **보안 / 암호화 진단** | 대상 드라이브 및 전체 드라이브의 **BitLocker 설정 여부**와 **UEFI Secure Boot 켜짐/꺼짐 상태** 실시간 표시 및 **[BitLocker 상세 확인]** 리포트 제공 |
 | **BitLocker 일시 중지** | 암호화 보호가 켜진 드라이브일 경우 지정한 재부팅 횟수(기본 `2`회) 동안 `manage-bde`로 보호 자동 일시 중지 |
 | **무인 네트워크 동기화** | 물리 NIC(Hyper-V 외부 가상 스위치 브리지 환경 포함) 자동 식별, 고정 IP/DHCP 및 수동/자동 DNS 판별, `pnputil` 랜카드 드라이버 추출, `netsh wlan` Wi-Fi 프로필 XML 추출 |
-| **원격지원(애니서포트) 자동 연결** | 부팅 전 원격지원 인증번호(예: 6자리 숫자)를 입력하고 부팅하면, WinPE 부팅 후 네트워크 연결 확인 → `ManualLauncher.exe` 감지 및 실행 → 인증번호 3중 주입(`WM_SETTEXT`, 클립보드, 키보드) → [접속/연결] 버튼 자동 클릭으로 무인 원격 대기 모드 진입 |
+| **원격지원(애니서포트) 자동 연결** | 부팅 전 원격지원 인증번호(예: 6자리 숫자)를 입력하고 부팅하면, WinPE 부팅 후 상위 가로막음 창을 후면으로 내리고 `ManualLauncher.exe` 창을 최상위 선택(`AttachThreadInput` + `HWND_TOPMOST`) → 하드웨어 키보드(`SendInput`) 기반으로 인증번호 타이핑 → 키보드(`Enter` 및 `Tab`→`Enter`/`Space`)로 [접속/연결] 버튼 실행 |
 | **WIM 무인 자동 실행 패치** | DISM으로 `boot.wim`을 마운트하여 표준 PE(`startnet.cmd`)와 커스텀 PECMD/GUI PE(`winpeshl.ini`, `Startup`) 모두에서 `OneTimePE.exe --pe-boot-init`이 1회 자동 실행되도록 패치 |
 | **추가 변수** | 세미콜론(`;`)으로 구분하여 추가 `bcdedit /set {GUID} <변수>` 명령 지정 가능 |
 

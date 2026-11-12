@@ -1102,7 +1102,10 @@ bool IsWimUnattendedPatched(const std::wstring& wimFullPath, uint32_t imageIndex
                         if (!ok) {
                             ok = pExtract(hImg, L"Windows\\System32\\OneTimePE_WimPatch.ini", probeDst.c_str(), 0);
                         }
-                        patched = ok && (GetFileAttributesW(probeDst.c_str()) != INVALID_FILE_ATTRIBUTES);
+                        if (ok && GetFileAttributesW(probeDst.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                            int ver = static_cast<int>(GetPrivateProfileIntW(L"WimPatch", L"Version", 0, probeDst.c_str()));
+                            patched = (ver >= 3);
+                        }
                         DeleteFileW(probeDst.c_str());
                         pClose(hImg);
                     }
@@ -2850,12 +2853,23 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
     EnsureDirectoryRecursive(mountDir);
 
     // Self-contained RAMDisk bootstrapper placed inside X:\Windows\System32\OneTimePE_BootInit.cmd
-    // Runs OneTimePE_Helper.exe directly from X:\Windows\System32 even when C: has NO drive letter!
+    // 1) Restores C: drive via OneTimePE_Helper.exe, 2) Delegates to latest OneTimePE_Runner.exe on host drive if present
     const std::string bootInitScript =
         "@echo off\r\n"
         "setlocal\r\n"
         "if exist \"X:\\Windows\\Temp\\OneTimePE_BootInitDone.flg\" exit /b 0\r\n"
         "if not exist \"X:\\Windows\\Temp\" mkdir \"X:\\Windows\\Temp\" >nul 2>&1\r\n"
+        "if exist \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" (\r\n"
+        "    \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" --pe-fix-drives\r\n"
+        ") else if exist \"X:\\Windows\\System32\\OneTimePE_Helper.exe\" (\r\n"
+        "    \"X:\\Windows\\System32\\OneTimePE_Helper.exe\" --pe-fix-drives\r\n"
+        ")\r\n"
+        "for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (\r\n"
+        "    if exist \"%%D:\\Windows\\Temp\\OneTimePE_Runner.exe\" (\r\n"
+        "        start \"\" /min \"%%D:\\Windows\\Temp\\OneTimePE_Runner.exe\" --pe-boot-init\r\n"
+        "        exit /b 0\r\n"
+        "    )\r\n"
+        ")\r\n"
         "if exist \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" (\r\n"
         "    start \"\" /min \"%SystemRoot%\\System32\\OneTimePE_Helper.exe\" --pe-boot-init\r\n"
         "    exit /b 0\r\n"
@@ -2869,9 +2883,10 @@ bool PatchBootWimUnattended(const std::wstring& appDir,
 
     const std::string patchMetaIni =
         "[WimPatch]\r\n"
-        "Version=2\r\n"
+        "Version=3\r\n"
         "FixDrives=1\r\n"
-        "AutoNetSupport=1\r\n";
+        "AutoNetSupport=1\r\n"
+        "RemoteSupport=1\r\n";
 
     for (int idx : indices) {
         if (logCb) {
@@ -3903,31 +3918,240 @@ int RunPeFixDrivesMode() {
 
 // ============================================================================
 // AnySupport (ManualLauncher.exe) Auto-Connect Engine inside WinPE
+// (Window Selection + Topmost Z-Order Enforcement + Pure Keyboard SendInput)
 // ============================================================================
 int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName) {
     if (code.empty()) return 0;
 
+    HANDLE hRemMutex = CreateMutexW(nullptr, FALSE, L"Local\\OneTimePE_RemoteSupport_Active");
+    if (hRemMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(hRemMutex);
+        return 0;
+    }
+
     auto logRemote = [](const std::wstring& msg) {
+        SYSTEMTIME st{};
+        GetLocalTime(&st);
+        wchar_t ts[40]{};
+        swprintf_s(ts, L"[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
         wchar_t winDir[MAX_PATH]{};
         GetWindowsDirectoryW(winDir, MAX_PATH);
         std::wstring l1 = JoinPath(winDir, L"Temp\\OneTimePE_RemoteSupport.log");
         std::wstring l2 = L"C:\\Windows\\Temp\\OneTimePE_RemoteSupport.log";
-        std::string line = WideToUtf8(msg) + "\r\n";
+        std::string line = WideToUtf8(std::wstring(ts) + msg) + "\r\n";
         AppendAsciiFile(l1, line);
         if (_wcsicmp(l1.c_str(), l2.c_str()) != 0) {
             AppendAsciiFile(l2, line);
         }
     };
 
+    std::wstring targetExe = exeName.empty() ? L"ManualLauncher.exe" : exeName;
     logRemote(L"============================================================");
-    logRemote(L"애니서포트(원격지원) 자동 연결 엔진 시작");
+    logRemote(L"애니서포트(원격지원) 키보드 기반 창 선택 & 자동 연결 엔진 시작");
     logRemote(L"• 인증번호: " + code);
-    logRemote(L"• 대상 실행 파일명: " + (exeName.empty() ? L"ManualLauncher.exe" : exeName));
+    logRemote(L"• 대상 실행 파일명: " + targetExe);
     logRemote(L"============================================================");
 
-    // 1. 네트워크 준비 대기 (최대 15초)
-    logRemote(L"원격 접속을 위한 네트워크 IP 할당 상태 확인 중...");
-    for (int t = 0; t < 15; ++t) {
+    DWORD selfPid = GetCurrentProcessId();
+
+    // Helper: Collect target PIDs (ManualLauncher.exe and any child processes it spawned)
+    auto findTargetPids = [&](const std::wstring& name) -> std::vector<DWORD> {
+        std::vector<DWORD> pids;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE) return pids;
+        struct ProcNode { DWORD pid; DWORD ppid; std::wstring exe; };
+        std::vector<ProcNode> all;
+        PROCESSENTRY32W pe{};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (pe.th32ProcessID == selfPid) continue;
+                all.push_back({ pe.th32ProcessID, pe.th32ParentProcessID, ToLower(pe.szExeFile) });
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+
+        std::wstring lowTarget = ToLower(name);
+        for (const auto& p : all) {
+            if (p.exe == lowTarget ||
+                p.exe == L"manuallauncher.exe" ||
+                p.exe.find(L"anysupport") != std::wstring::npos) {
+                pids.push_back(p.pid);
+            }
+        }
+        // Include direct child processes of matched launcher PIDs
+        size_t baseCount = pids.size();
+        for (size_t i = 0; i < baseCount; ++i) {
+            DWORD parentPid = pids[i];
+            for (const auto& p : all) {
+                if (p.ppid == parentPid &&
+                    p.exe != L"cmd.exe" && p.exe != L"conhost.exe" &&
+                    std::find(pids.begin(), pids.end(), p.pid) == pids.end()) {
+                    pids.push_back(p.pid);
+                }
+            }
+        }
+        return pids;
+    };
+
+    // Helper: Find main visible window of AnySupport / ManualLauncher
+    struct WindowSearchCtx {
+        std::vector<DWORD> targetPids;
+        std::wstring exeNameLower;
+        DWORD selfPid;
+        HWND hWndFound = nullptr;
+    };
+
+    auto enumWndProc = [](HWND hWnd, LPARAM lParam) -> BOOL {
+        auto* ctx = reinterpret_cast<WindowSearchCtx*>(lParam);
+        if (!IsWindowVisible(hWnd)) return TRUE;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hWnd, &pid);
+        if (pid == 0 || pid == ctx->selfPid) return TRUE;
+
+        RECT rc{};
+        GetWindowRect(hWnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+        if (w < 140 || h < 80) return TRUE;
+
+        wchar_t clsBuf[128]{};
+        GetClassNameW(hWnd, clsBuf, _countof(clsBuf));
+        std::wstring cls = ToLower(clsBuf);
+        if (cls == L"shell_traywnd" || cls == L"progman" || cls == L"workerw" ||
+            cls == L"consolewindowclass") {
+            return TRUE;
+        }
+
+        // 1) Match by PID (launcher or its child GUI process)
+        if (std::find(ctx->targetPids.begin(), ctx->targetPids.end(), pid) != ctx->targetPids.end()) {
+            ctx->hWndFound = hWnd;
+            return FALSE;
+        }
+
+        // 2) Match by Window Title
+        wchar_t titleBuf[256]{};
+        GetWindowTextW(hWnd, titleBuf, _countof(titleBuf));
+        std::wstring title = ToLower(titleBuf);
+        if (title.find(L"애니서포트") != std::wstring::npos ||
+            title.find(L"anysupport") != std::wstring::npos ||
+            title.find(L"manuallauncher") != std::wstring::npos ||
+            title.find(L"원격지원") != std::wstring::npos ||
+            title.find(L"접속번호") != std::wstring::npos ||
+            title.find(L"인증번호") != std::wstring::npos) {
+            ctx->hWndFound = hWnd;
+            return FALSE;
+        }
+
+        // 3) Match by process image name
+        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProc) {
+            wchar_t imgPath[MAX_PATH * 2]{};
+            DWORD imgSize = _countof(imgPath);
+            if (QueryFullProcessImageNameW(hProc, 0, imgPath, &imgSize)) {
+                std::wstring fn = ToLower(FileNameFromPath(imgPath));
+                if (fn == ctx->exeNameLower ||
+                    fn == L"manuallauncher.exe" ||
+                    fn.find(L"anysupport") != std::wstring::npos) {
+                    ctx->hWndFound = hWnd;
+                    CloseHandle(hProc);
+                    return FALSE;
+                }
+            }
+            CloseHandle(hProc);
+        }
+
+        // 4) Match by child control text (for skin windows with empty outer title)
+        bool childMatched = false;
+        EnumChildWindows(hWnd, [](HWND hChild, LPARAM lp) -> BOOL {
+            wchar_t cTxt[256]{};
+            GetWindowTextW(hChild, cTxt, _countof(cTxt));
+            std::wstring lt = ToLower(cTxt);
+            if (lt.find(L"애니서포트") != std::wstring::npos ||
+                lt.find(L"anysupport") != std::wstring::npos ||
+                lt.find(L"접속번호") != std::wstring::npos) {
+                *reinterpret_cast<bool*>(lp) = true;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&childMatched));
+
+        if (childMatched) {
+            ctx->hWndFound = hWnd;
+            return FALSE;
+        }
+        return TRUE;
+    };
+
+    // 1. Wait for AnySupport window to appear (up to 90 seconds)
+    HWND hTargetWnd = nullptr;
+    bool triedFallbackLaunch = false;
+    logRemote(L"커스텀 PE에서 실행된 애니서포트 창 감시 중 (최대 90초 대기)...");
+
+    for (int t = 0; t < 180; ++t) {
+        std::vector<DWORD> pids = findTargetPids(targetExe);
+        WindowSearchCtx ctx{ pids, ToLower(targetExe), selfPid, nullptr };
+        EnumWindows(enumWndProc, reinterpret_cast<LPARAM>(&ctx));
+        if (ctx.hWndFound != nullptr) {
+            hTargetWnd = ctx.hWndFound;
+            break;
+        }
+
+        // Only if 20 seconds have elapsed and the process hasn't started at all, try searching disk as fallback
+        if (t == 40 && pids.empty() && !triedFallbackLaunch) {
+            triedFallbackLaunch = true;
+            logRemote(L"20초 경과 후에도 프로세스가 감지되지 않아 디스크 내 " + targetExe + L" 보조 탐색을 시도합니다...");
+            const std::vector<std::wstring> searchSubPaths = {
+                L"", L"\\Program Files", L"\\Program Files (x86)",
+                L"\\PETools", L"\\Tools", L"\\AnySupport", L"\\Windows\\System32"
+            };
+            const wchar_t drvs[] = { L'X', L'C', L'D', L'Y', L'E', L'F' };
+            std::wstring foundExePath;
+            for (wchar_t d : drvs) {
+                for (const auto& sub : searchSubPaths) {
+                    std::wstring cand = std::wstring(1, d) + L":" + sub + L"\\" + targetExe;
+                    if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                        foundExePath = cand;
+                        break;
+                    }
+                }
+                if (!foundExePath.empty()) break;
+            }
+            if (!foundExePath.empty()) {
+                logRemote(L"보조 실행: " + foundExePath);
+                std::wstring cmdLine = L"\"" + foundExePath + L"\"";
+                STARTUPINFOW si{};
+                si.cb = sizeof(si);
+                PROCESS_INFORMATION pi{};
+                if (CreateProcessW(foundExePath.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+            }
+        }
+        Sleep(500);
+    }
+
+    if (!hTargetWnd) {
+        logRemote(L"경고: 90초 대기 시간 내에 애니서포트 창이 감지되지 않아 종료합니다.");
+        if (hRemMutex) CloseHandle(hRemMutex);
+        return 1;
+    }
+
+    wchar_t foundTitle[256]{};
+    GetWindowTextW(hTargetWnd, foundTitle, _countof(foundTitle));
+    wchar_t foundCls[128]{};
+    GetClassNameW(hTargetWnd, foundCls, _countof(foundCls));
+    logRemote(L"★ 애니서포트 창 감지 완료! 제목=[" + std::wstring(foundTitle) +
+              L"], 클래스=[" + std::wstring(foundCls) +
+              L"], HWND=" + std::to_wstring(reinterpret_cast<uintptr_t>(hTargetWnd)));
+
+    // 2. Wait 1.5s for other PE startup windows (PECMD/CMD/PENetwork) to finish popping up & UI controls to initialize
+    Sleep(1500);
+
+    // Ensure network IP is ready (up to 10s; breaks immediately if IP is already assigned)
+    for (int t = 0; t < 10; ++t) {
         DWORD outBufLen = 15000;
         std::vector<BYTE> buf(outBufLen);
         auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
@@ -3950,158 +4174,163 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
             }
         }
         if (hasIp) {
-            logRemote(L"네트워크 정상 연결 확인됨 (" + std::to_wstring(t + 1) + L"초 소요).");
+            logRemote(L"네트워크 IP 할당 확인 완료.");
             break;
         }
         Sleep(1000);
     }
 
-    // 2. 프로세스 실행 여부 확인 및 필요 시 자동 기동
-    std::wstring targetExe = exeName.empty() ? L"ManualLauncher.exe" : exeName;
-    auto findProcPid = [&](const std::wstring& name) -> DWORD {
-        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnap == INVALID_HANDLE_VALUE) return 0;
-        PROCESSENTRY32W pe{};
-        pe.dwSize = sizeof(pe);
-        DWORD foundPid = 0;
-        if (Process32FirstW(hSnap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, name.c_str()) == 0) {
-                    foundPid = pe.th32ProcessID;
-                    break;
-                }
-            } while (Process32NextW(hSnap, &pe));
-        }
-        CloseHandle(hSnap);
-        return foundPid;
+    // 3. Hardware Keyboard Simulation Helpers (SendInput with Virtual Key + Scan Code)
+    auto sendKeyTap = [](WORD vk, DWORD holdMs = 35, DWORD afterMs = 45) {
+        WORD scan = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+        INPUT in[2]{};
+        in[0].type = INPUT_KEYBOARD;
+        in[0].ki.wVk = vk;
+        in[0].ki.wScan = scan;
+
+        in[1].type = INPUT_KEYBOARD;
+        in[1].ki.wVk = vk;
+        in[1].ki.wScan = scan;
+        in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+
+        SendInput(1, &in[0], sizeof(INPUT));
+        Sleep(holdMs);
+        SendInput(1, &in[1], sizeof(INPUT));
+        Sleep(afterMs);
     };
 
-    DWORD targetPid = findProcPid(targetExe);
-    if (targetPid == 0) {
-        logRemote(targetExe + L" 프로세스가 아직 실행되지 않아 디스크 탐색을 시작합니다...");
-        std::wstring foundExePath;
-        const std::vector<std::wstring> searchSubPaths = {
-            L"",
-            L"\\Program Files",
-            L"\\Program Files (x86)",
-            L"\\PETools",
-            L"\\Tools",
-            L"\\AnySupport",
-            L"\\Windows\\System32"
-        };
-        const wchar_t drvs[] = { L'X', L'C', L'D', L'Y', L'E', L'F' };
-        for (wchar_t d : drvs) {
-            for (const auto& sub : searchSubPaths) {
-                std::wstring cand = std::wstring(1, d) + L":" + sub + L"\\" + targetExe;
-                if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    foundExePath = cand;
-                    break;
-                }
+    auto sendCtrlKey = [](WORD vk) {
+        WORD scanCtrl = static_cast<WORD>(MapVirtualKeyW(VK_CONTROL, MAPVK_VK_TO_VSC));
+        WORD scanKey  = static_cast<WORD>(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC));
+        INPUT dn[2]{};
+        dn[0].type = INPUT_KEYBOARD; dn[0].ki.wVk = VK_CONTROL; dn[0].ki.wScan = scanCtrl;
+        dn[1].type = INPUT_KEYBOARD; dn[1].ki.wVk = vk;         dn[1].ki.wScan = scanKey;
+        SendInput(2, dn, sizeof(INPUT));
+        Sleep(35);
+
+        INPUT up[2]{};
+        up[0].type = INPUT_KEYBOARD; up[0].ki.wVk = vk;         up[0].ki.wScan = scanKey;  up[0].ki.dwFlags = KEYEVENTF_KEYUP;
+        up[1].type = INPUT_KEYBOARD; up[1].ki.wVk = VK_CONTROL; up[1].ki.wScan = scanCtrl; up[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(2, up, sizeof(INPUT));
+        Sleep(45);
+    };
+
+    auto sendUnicodeChar = [](wchar_t ch) {
+        INPUT in[2]{};
+        in[0].type = INPUT_KEYBOARD;
+        in[0].ki.wScan = ch;
+        in[0].ki.dwFlags = KEYEVENTF_UNICODE;
+
+        in[1].type = INPUT_KEYBOARD;
+        in[1].ki.wScan = ch;
+        in[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
+
+        SendInput(1, &in[0], sizeof(INPUT));
+        Sleep(30);
+        SendInput(1, &in[1], sizeof(INPUT));
+        Sleep(45);
+    };
+
+    // 4. Forceful Window Selection Helper:
+    //    Demotes any obstructing top windows to HWND_BOTTOM, elevates hTargetWnd to HWND_TOPMOST,
+    //    attaches thread input queues, and assigns active keyboard focus directly to hFocusCtrl!
+    auto forceSelectWindowAndFocus = [&](HWND hWndTarget, HWND hFocusCtrl) {
+        if (!IsWindow(hWndTarget)) return;
+
+        // A. Demote any other window currently sitting in the foreground or topmost
+        HWND hFg = GetForegroundWindow();
+        if (hFg && hFg != hWndTarget) {
+            wchar_t fgTitle[128]{};
+            wchar_t fgCls[128]{};
+            GetWindowTextW(hFg, fgTitle, _countof(fgTitle));
+            GetClassNameW(hFg, fgCls, _countof(fgCls));
+            if (_wcsicmp(fgCls, L"Shell_TrayWnd") != 0 && _wcsicmp(fgCls, L"Progman") != 0) {
+                logRemote(L"상위 가로막음 창 감지 -> 후면(HWND_BOTTOM) 이동: [" +
+                          std::wstring(fgTitle) + L" / " + std::wstring(fgCls) + L"]");
+                SetWindowPos(hFg, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SetWindowPos(hFg, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             }
-            if (!foundExePath.empty()) break;
         }
 
-        if (!foundExePath.empty()) {
-            logRemote(L"실행 파일 발견: " + foundExePath + L" -> 인증번호 매개변수와 함께 실행합니다.");
-            std::wstring cmdLine = L"\"" + foundExePath + L"\" " + code;
-            STARTUPINFOW si{};
-            si.cb = sizeof(si);
-            PROCESS_INFORMATION pi{};
-            if (CreateProcessW(foundExePath.c_str(), cmdLine.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-                targetPid = pi.dwProcessId;
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-                logRemote(L"프로세스 실행 완료 (PID: " + std::to_wstring(targetPid) + L")");
-            } else {
-                logRemote(L"CreateProcess 실패 (오류 코드: " + std::to_wstring(GetLastError()) + L")");
+        // Also demote any other visible topmost windows that might cover hWndTarget
+        EnumWindows([](HWND hTop, LPARAM lp) -> BOOL {
+            HWND hTarget = reinterpret_cast<HWND>(lp);
+            if (hTop == hTarget || !IsWindowVisible(hTop)) return TRUE;
+            LONG exStyle = GetWindowLongW(hTop, GWL_EXSTYLE);
+            if (exStyle & WS_EX_TOPMOST) {
+                wchar_t cBuf[128]{};
+                GetClassNameW(hTop, cBuf, _countof(cBuf));
+                if (_wcsicmp(cBuf, L"Shell_TrayWnd") != 0) {
+                    SetWindowPos(hTop, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    SetWindowPos(hTop, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(hWndTarget));
+
+        // B. Disable foreground lock timeout & unlock win32k foreground activation
+        SystemParametersInfoW(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, nullptr, SPIF_SENDCHANGE);
+        AllowSetForegroundWindow(ASFW_ANY);
+
+        if (IsIconic(hWndTarget)) {
+            ShowWindow(hWndTarget, SW_RESTORE);
         } else {
-            logRemote(L"드라이브 검색에서 직접 실행 파일을 찾지 못했습니다. 시스템 자동실행 스크립트가 기동할 때까지 창 감시 루프로 대기합니다.");
+            ShowWindow(hWndTarget, SW_SHOW);
         }
-    } else {
-        logRemote(L"이미 실행 중인 " + targetExe + L" 프로세스 감지됨 (PID: " + std::to_wstring(targetPid) + L")");
-    }
+        SetWindowPos(hWndTarget, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
 
-    // 3. 애니서포트 윈도우 감시 루프 (최대 60초)
-    struct WindowSearchCtx {
-        DWORD targetPid;
-        std::wstring exeName;
-        HWND hWndFound = nullptr;
+        DWORD curThreadId = GetCurrentThreadId();
+        DWORD fgThreadId  = hFg ? GetWindowThreadProcessId(hFg, nullptr) : 0;
+        DWORD tgtThreadId = GetWindowThreadProcessId(hWndTarget, nullptr);
+
+        bool attachedFg  = false;
+        bool attachedTgt = false;
+        if (fgThreadId != 0 && fgThreadId != curThreadId) {
+            attachedFg = (AttachThreadInput(curThreadId, fgThreadId, TRUE) != FALSE);
+        }
+        if (tgtThreadId != 0 && tgtThreadId != curThreadId && tgtThreadId != fgThreadId) {
+            attachedTgt = (AttachThreadInput(curThreadId, tgtThreadId, TRUE) != FALSE);
+        }
+
+        // Alt key state unlock for SetForegroundWindow
+        keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, 0);
+        keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0);
+
+        BringWindowToTop(hWndTarget);
+        SetForegroundWindow(hWndTarget);
+        SetActiveWindow(hWndTarget);
+        SendMessageW(hWndTarget, WM_ACTIVATE, WA_ACTIVE, 0);
+
+        if (hFocusCtrl && IsWindow(hFocusCtrl)) {
+            SendMessageW(hWndTarget, WM_NEXTDLGCTL, reinterpret_cast<WPARAM>(hFocusCtrl), TRUE);
+            SetFocus(hFocusCtrl);
+        } else {
+            SetFocus(hWndTarget);
+        }
+
+        if (attachedTgt) AttachThreadInput(curThreadId, tgtThreadId, FALSE);
+        if (attachedFg)  AttachThreadInput(curThreadId, fgThreadId, FALSE);
+        Sleep(150);
     };
 
-    auto enumWndProc = [](HWND hWnd, LPARAM lParam) -> BOOL {
-        auto* ctx = reinterpret_cast<WindowSearchCtx*>(lParam);
-        if (!IsWindowVisible(hWnd)) return TRUE;
-
-        RECT rc{};
-        GetWindowRect(hWnd, &rc);
-        if ((rc.right - rc.left) < 120 || (rc.bottom - rc.top) < 80) return TRUE;
-
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hWnd, &pid);
-        if (ctx->targetPid != 0 && pid == ctx->targetPid) {
-            ctx->hWndFound = hWnd;
-            return FALSE;
-        }
-
-        wchar_t titleBuf[256]{};
-        GetWindowTextW(hWnd, titleBuf, _countof(titleBuf));
-        std::wstring title = ToLower(titleBuf);
-        if (title.find(L"애니서포트") != std::wstring::npos ||
-            title.find(L"anysupport") != std::wstring::npos ||
-            title.find(L"manuallauncher") != std::wstring::npos ||
-            title.find(L"원격지원") != std::wstring::npos) {
-            ctx->hWndFound = hWnd;
-            return FALSE;
-        }
-
-        HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (hProc) {
-            wchar_t imgPath[MAX_PATH * 2]{};
-            DWORD imgSize = _countof(imgPath);
-            if (QueryFullProcessImageNameW(hProc, 0, imgPath, &imgSize)) {
-                std::wstring fn = ToLower(FileNameFromPath(imgPath));
-                if (fn == ToLower(ctx->exeName)) {
-                    ctx->hWndFound = hWnd;
-                    CloseHandle(hProc);
-                    return FALSE;
-                }
+    auto typeStringViaKeyboard = [&](const std::wstring& str, HWND hFocusCtrl) {
+        for (wchar_t ch : str) {
+            if (GetForegroundWindow() != hTargetWnd) {
+                forceSelectWindowAndFocus(hTargetWnd, hFocusCtrl);
             }
-            CloseHandle(hProc);
+            if (ch >= L'0' && ch <= L'9') {
+                sendKeyTap(static_cast<WORD>(L'0' + (ch - L'0')), 35, 50);
+            } else if (ch >= L'a' && ch <= L'z') {
+                sendKeyTap(static_cast<WORD>(L'A' + (ch - L'a')), 35, 50);
+            } else if (ch >= L'A' && ch <= L'Z') {
+                sendKeyTap(static_cast<WORD>(L'A' + (ch - L'A')), 35, 50);
+            } else {
+                sendUnicodeChar(ch);
+            }
         }
-        return TRUE;
     };
 
-    HWND hTargetWnd = nullptr;
-    logRemote(L"애니서포트 프로그램 창 감시 시작 (최대 60초 대기)...");
-    for (int t = 0; t < 120; ++t) {
-        WindowSearchCtx ctx{ targetPid, targetExe, nullptr };
-        EnumWindows(enumWndProc, reinterpret_cast<LPARAM>(&ctx));
-        if (ctx.hWndFound != nullptr) {
-            hTargetWnd = ctx.hWndFound;
-            break;
-        }
-        Sleep(500);
-    }
-
-    if (!hTargetWnd) {
-        logRemote(L"경고: 60초 대기 시간 내에 애니서포트 창이 감지되지 않아 자동 입력을 종료합니다.");
-        return 1;
-    }
-
-    wchar_t foundTitle[256]{};
-    GetWindowTextW(hTargetWnd, foundTitle, _countof(foundTitle));
-    logRemote(L"★ 애니서포트 창 감지 성공! 제목: [" + std::wstring(foundTitle) + L"], HWND=" + std::to_wstring(reinterpret_cast<uintptr_t>(hTargetWnd)));
-
-    // 4. 창 활성화 및 렌더링 대기
-    Sleep(600);
-    ShowWindow(hTargetWnd, SW_SHOWNORMAL);
-    SetForegroundWindow(hTargetWnd);
-    BringWindowToTop(hTargetWnd);
-    SetActiveWindow(hTargetWnd);
-    Sleep(300);
-
-    // 5. 자식 컨트롤 열거
+    // 5. Multi-Pass Keyboard Input & Connect Sequence (up to 3 passes in case a late PE popup interrupts)
     struct ChildCtrl {
         HWND hWnd;
         std::wstring cls;
@@ -4109,154 +4338,192 @@ int RunPeRemoteSupportMode(const std::wstring& code, const std::wstring& exeName
         int id;
         RECT rc;
     };
-    std::vector<ChildCtrl> children;
-    auto enumChildProc = [](HWND hChild, LPARAM lParam) -> BOOL {
-        auto* vec = reinterpret_cast<std::vector<ChildCtrl>*>(lParam);
-        wchar_t clsBuf[128]{};
-        GetClassNameW(hChild, clsBuf, _countof(clsBuf));
-        wchar_t txtBuf[256]{};
-        GetWindowTextW(hChild, txtBuf, _countof(txtBuf));
-        RECT r{};
-        GetWindowRect(hChild, &r);
-        vec->push_back({ hChild, ToLower(clsBuf), txtBuf, GetDlgCtrlID(hChild), r });
-        return TRUE;
-    };
-    EnumChildWindows(hTargetWnd, enumChildProc, reinterpret_cast<LPARAM>(&children));
-    logRemote(L"창 내부 자식 컨트롤 수: " + std::to_wstring(children.size()) + L"개");
 
-    // 6. Edit 컨트롤에 인증번호 입력
-    HWND hEditTarget = nullptr;
-    for (const auto& c : children) {
-        if (c.cls.find(L"edit") != std::wstring::npos) {
-            if (!IsWindowVisible(c.hWnd) || !IsWindowEnabled(c.hWnd)) continue;
-            LONG style = GetWindowLongW(c.hWnd, GWL_STYLE);
-            if (style & ES_READONLY) continue;
-            hEditTarget = c.hWnd;
+    for (int pass = 1; pass <= 3; ++pass) {
+        if (!IsWindow(hTargetWnd) || !IsWindowVisible(hTargetWnd)) {
+            logRemote(L"애니서포트 창이 닫히거나 연결 화면으로 전환됨 (Pass " + std::to_wstring(pass) + L")");
             break;
         }
-    }
 
-    bool codeSetOk = false;
-    if (hEditTarget) {
-        logRemote(L"인증번호 입력 Edit 컨트롤 발견 (ID: " + std::to_wstring(GetDlgCtrlID(hEditTarget)) + L") -> WM_SETTEXT 주입 시도");
-        SetFocus(hEditTarget);
-        SendMessageW(hEditTarget, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(code.c_str()));
+        logRemote(L"--- 키보드 입력 및 연결 시도 (Pass " + std::to_wstring(pass) + L"/3) ---");
 
-        wchar_t verifyBuf[128]{};
-        GetWindowTextW(hEditTarget, verifyBuf, _countof(verifyBuf));
-        if (wcscmp(verifyBuf, code.c_str()) == 0) {
-            codeSetOk = true;
-            logRemote(L"인증번호 WM_SETTEXT 입력 검증 완료: [" + code + L"]");
-        } else {
-            logRemote(L"WM_SETTEXT 검증 불일치 -> 클립보드 붙여넣기(Ctrl+V) 모드로 전환합니다.");
-        }
-    }
+        std::vector<ChildCtrl> children;
+        EnumChildWindows(hTargetWnd, [](HWND hChild, LPARAM lParam) -> BOOL {
+            auto* vec = reinterpret_cast<std::vector<ChildCtrl>*>(lParam);
+            wchar_t clsBuf[128]{};
+            GetClassNameW(hChild, clsBuf, _countof(clsBuf));
+            wchar_t txtBuf[256]{};
+            GetWindowTextW(hChild, txtBuf, _countof(txtBuf));
+            RECT r{};
+            GetWindowRect(hChild, &r);
+            vec->push_back({ hChild, ToLower(clsBuf), txtBuf, GetDlgCtrlID(hChild), r });
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&children));
 
-    // Fallback: If WM_SETTEXT didn't take effect (custom edit control, owner-drawn, etc.)
-    if (!codeSetOk) {
-        if (hEditTarget) {
-            SetFocus(hEditTarget);
-            SendMessageW(hEditTarget, EM_SETSEL, 0, -1);
-        } else {
-            SetFocus(hTargetWnd);
-        }
+        std::vector<ChildCtrl> editCtrls;
+        HWND hBtnConnect = nullptr;
+        HWND hFirstVisibleBtn = nullptr;
 
-        // Clear existing text by Ctrl+A -> Backspace
-        keybd_event(VK_CONTROL, 0, 0, 0);
-        keybd_event('A', 0, 0, 0);
-        Sleep(30);
-        keybd_event('A', 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-        Sleep(30);
-        keybd_event(VK_BACK, 0, 0, 0);
-        Sleep(30);
-        keybd_event(VK_BACK, 0, KEYEVENTF_KEYUP, 0);
-        Sleep(30);
+        for (const auto& c : children) {
+            if (pass == 1) {
+                logRemote(L" • 자식 컨트롤: cls=[" + c.cls + L"], id=" + std::to_wstring(c.id) + L", text=[" + c.text + L"]");
+            }
+            if (!IsWindowVisible(c.hWnd) || !IsWindowEnabled(c.hWnd)) continue;
 
-        // Clipboard Ctrl+V injection
-        if (OpenClipboard(nullptr)) {
-            EmptyClipboard();
-            size_t bytes = (code.size() + 1) * sizeof(wchar_t);
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-            if (hMem) {
-                void* p = GlobalLock(hMem);
-                if (p) {
-                    memcpy(p, code.c_str(), bytes);
-                    GlobalUnlock(hMem);
-                    SetClipboardData(CF_UNICODETEXT, hMem);
+            if (c.cls.find(L"edit") != std::wstring::npos) {
+                LONG style = GetWindowLongW(c.hWnd, GWL_STYLE);
+                if (!(style & ES_READONLY)) {
+                    editCtrls.push_back(c);
+                }
+            } else if (c.cls.find(L"button") != std::wstring::npos) {
+                LONG bStyle = GetWindowLongW(c.hWnd, GWL_STYLE) & BS_TYPEMASK;
+                if (bStyle == BS_PUSHBUTTON || bStyle == BS_DEFPUSHBUTTON || bStyle == BS_OWNERDRAW) {
+                    if (!hFirstVisibleBtn) hFirstVisibleBtn = c.hWnd;
+                    std::wstring lowT = ToLower(c.text);
+                    if (lowT.find(L"연결") != std::wstring::npos ||
+                        lowT.find(L"접속") != std::wstring::npos ||
+                        lowT.find(L"확인") != std::wstring::npos ||
+                        lowT.find(L"시작") != std::wstring::npos ||
+                        lowT.find(L"connect") != std::wstring::npos ||
+                        lowT.find(L"ok") != std::wstring::npos ||
+                        lowT.find(L"start") != std::wstring::npos) {
+                        hBtnConnect = c.hWnd;
+                    }
                 }
             }
-            CloseClipboard();
         }
-        keybd_event(VK_CONTROL, 0, 0, 0);
-        keybd_event('V', 0, 0, 0);
-        Sleep(40);
-        keybd_event('V', 0, KEYEVENTF_KEYUP, 0);
-        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
-        Sleep(100);
+        if (!hBtnConnect && hFirstVisibleBtn) {
+            hBtnConnect = hFirstVisibleBtn;
+        }
 
-        if (hEditTarget) {
-            wchar_t verifyBuf2[128]{};
-            GetWindowTextW(hEditTarget, verifyBuf2, _countof(verifyBuf2));
-            if (wcscmp(verifyBuf2, code.c_str()) == 0) {
-                codeSetOk = true;
-                logRemote(L"클립보드(Ctrl+V) 입력 검증 완료: [" + code + L"]");
+        // Sort edit controls left-to-right, top-to-bottom
+        std::sort(editCtrls.begin(), editCtrls.end(), [](const ChildCtrl& a, const ChildCtrl& b) {
+            if (std::abs(a.rc.top - b.rc.top) > 12) return a.rc.top < b.rc.top;
+            return a.rc.left < b.rc.left;
+        });
+
+        HWND hEditFirst = editCtrls.empty() ? nullptr : editCtrls[0].hWnd;
+
+        // Step A: Forcefully select the AnySupport window & focus the input control
+        forceSelectWindowAndFocus(hTargetWnd, hEditFirst);
+        logRemote(L"창 최상위 선택 완료 (Foreground=" +
+                  std::to_wstring(reinterpret_cast<uintptr_t>(GetForegroundWindow())) + L")");
+
+        // If no standard Edit HWND was found on pass >= 2, press Tab once to ensure input box focus
+        if (!hEditFirst && pass == 2) {
+            logRemote(L"커스텀 스킨 컨트롤 대응: Tab 키로 입력칸 포커스 이동");
+            sendKeyTap(VK_TAB, 40, 80);
+        }
+
+        // Step B: Clear existing characters in the input box using keyboard
+        if (hEditFirst) {
+            SendMessageW(hEditFirst, EM_SETSEL, 0, -1);
+        }
+        sendCtrlKey('A');
+        sendKeyTap(VK_BACK, 25, 35);
+        sendKeyTap(VK_DELETE, 25, 35);
+        sendKeyTap(VK_END, 20, 25);
+        for (int b = 0; b < 8; ++b) {
+            sendKeyTap(VK_BACK, 15, 15);
+        }
+        Sleep(60);
+
+        // Step C: Type passcode via hardware keyboard (SendInput)
+        logRemote(L"키보드(SendInput)로 인증번호 [" + code + L"] 타이핑 중...");
+        typeStringViaKeyboard(code, hEditFirst);
+        Sleep(150);
+
+        // Check if there are 2 split Edit boxes (e.g. [123] - [456]) where the 2nd box didn't auto-advance
+        if (editCtrls.size() >= 2 && code.size() >= 4) {
+            wchar_t b1[64]{}, b2[64]{};
+            GetWindowTextW(editCtrls[0].hWnd, b1, _countof(b1));
+            GetWindowTextW(editCtrls[1].hWnd, b2, _countof(b2));
+            size_t len1 = wcslen(b1);
+            size_t len2 = wcslen(b2);
+            if (len1 > 0 && len1 < code.size() && len2 == 0) {
+                std::wstring remPart = code.substr(len1);
+                logRemote(L"분할 입력칸 감지 (1번칸=" + std::wstring(b1) + L") -> 2번칸 선택 후 나머지 [" + remPart + L"] 키보드 입력");
+                forceSelectWindowAndFocus(hTargetWnd, editCtrls[1].hWnd);
+                typeStringViaKeyboard(remPart, editCtrls[1].hWnd);
+                Sleep(150);
             }
         }
 
-        // Secondary fallback if still not matched: direct WM_CHAR typing
-        if (!codeSetOk) {
-            logRemote(L"키보드(WM_CHAR) 직접 입력 전송");
-            for (wchar_t ch : code) {
-                PostMessageW(hTargetWnd, WM_CHAR, static_cast<WPARAM>(ch), 1);
-                if (hEditTarget) PostMessageW(hEditTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
+        // Verify Edit control text if standard Edit HWND exists; if still empty, Tab + re-type & WM_SETTEXT backup
+        if (hEditFirst) {
+            wchar_t verifyBuf[128]{};
+            GetWindowTextW(hEditFirst, verifyBuf, _countof(verifyBuf));
+            logRemote(L"입력칸 현재 텍스트 확인: [" + std::wstring(verifyBuf) + L"]");
+            if (wcslen(verifyBuf) == 0) {
+                logRemote(L"입력칸이 비어 있어 Tab 포커스 이동 후 키보드 재입력 및 WM_SETTEXT 보조 주입 실행");
+                forceSelectWindowAndFocus(hTargetWnd, hEditFirst);
+                sendKeyTap(VK_TAB, 40, 80);
+                typeStringViaKeyboard(code, hEditFirst);
+                GetWindowTextW(hEditFirst, verifyBuf, _countof(verifyBuf));
+                if (wcslen(verifyBuf) == 0) {
+                    SendMessageW(hEditFirst, WM_SETTEXT, 0, reinterpret_cast<LPARAM>(code.c_str()));
+                    SendMessageW(hTargetWnd, WM_COMMAND,
+                                 MAKEWPARAM(GetDlgCtrlID(hEditFirst), EN_CHANGE),
+                                 reinterpret_cast<LPARAM>(hEditFirst));
+                }
             }
         }
-    }
-    Sleep(250);
 
-    // 7. 연결/접속 버튼 클릭
-    HWND hBtnConnect = nullptr;
-    for (const auto& c : children) {
-        if (c.cls.find(L"button") != std::wstring::npos) {
-            std::wstring lowT = ToLower(c.text);
-            if (lowT.find(L"연결") != std::wstring::npos ||
-                lowT.find(L"접속") != std::wstring::npos ||
-                lowT.find(L"확인") != std::wstring::npos ||
-                lowT.find(L"시작") != std::wstring::npos ||
-                lowT.find(L"connect") != std::wstring::npos ||
-                lowT.find(L"ok") != std::wstring::npos ||
-                lowT.find(L"start") != std::wstring::npos) {
-                hBtnConnect = c.hWnd;
+        // Step D: Trigger Connect via Keyboard!
+        // 1) Press Enter (VK_RETURN) directly while in the input box
+        forceSelectWindowAndFocus(hTargetWnd, hEditFirst);
+        logRemote(L"1차 연결 실행: 입력창에서 Enter(VK_RETURN) 키 입력 전송");
+        sendKeyTap(VK_RETURN, 50, 100);
+        Sleep(700);
+
+        // 2) If window is still open and input box is still enabled, select Connect button via Keyboard (Tab / Focus) and press Enter + Space!
+        if (IsWindow(hTargetWnd) && IsWindowVisible(hTargetWnd)) {
+            bool stillWaitingInput = (!hEditFirst || (IsWindow(hEditFirst) && IsWindowVisible(hEditFirst) && IsWindowEnabled(hEditFirst)));
+            if (stillWaitingInput) {
+                if (hBtnConnect && IsWindow(hBtnConnect)) {
+                    logRemote(L"2차 연결 실행: 연결 버튼으로 키보드 포커스 이동 후 Enter / Space 입력");
+                    forceSelectWindowAndFocus(hTargetWnd, hBtnConnect);
+                    sendKeyTap(VK_RETURN, 50, 100);
+                    sendKeyTap(VK_SPACE, 50, 100);
+                    SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
+                } else {
+                    logRemote(L"2차 연결 실행: Tab 키로 연결 버튼 선택 후 Enter / Space 키 입력");
+                    forceSelectWindowAndFocus(hTargetWnd, nullptr);
+                    sendKeyTap(VK_TAB, 45, 100);
+                    sendKeyTap(VK_RETURN, 50, 100);
+                    Sleep(150);
+                    sendKeyTap(VK_SPACE, 50, 100);
+                }
+            }
+        }
+
+        // Wait 2.5s and check if connection started or if another window interrupted
+        Sleep(2500);
+        if (!IsWindow(hTargetWnd) || !IsWindowVisible(hTargetWnd)) {
+            logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력창 닫힘/전환 완료)!");
+            break;
+        }
+        if (hEditFirst && (!IsWindow(hEditFirst) || !IsWindowVisible(hEditFirst) || !IsWindowEnabled(hEditFirst))) {
+            logRemote(L"★ 애니서포트 연결 진행 확인됨 (입력 컨트롤 비활성/전환 완료)!");
+            break;
+        }
+        if (hEditFirst) {
+            wchar_t curTxt[128]{};
+            GetWindowTextW(hEditFirst, curTxt, _countof(curTxt));
+            if (wcslen(curTxt) > 0 && GetForegroundWindow() == hTargetWnd && pass >= 2) {
+                logRemote(L"★ 인증번호 입력 및 연결 키 전송 완료!");
                 break;
             }
         }
     }
 
-    if (hBtnConnect) {
-        wchar_t btnTxt[64]{};
-        GetWindowTextW(hBtnConnect, btnTxt, _countof(btnTxt));
-        logRemote(L"연결 버튼 감지: [" + std::wstring(btnTxt) + L"] -> BM_CLICK 클릭 메시지 전송");
-        SendMessageW(hBtnConnect, BM_CLICK, 0, 0);
-    } else {
-        logRemote(L"버튼 텍스트 미감지 -> 기본 Enter 키(VK_RETURN) 전송으로 연결 시도");
-        keybd_event(VK_RETURN, 0, 0, 0);
-        Sleep(60);
-        keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
+    // Restore normal Z-order (remove forced topmost so remote session windows work normally)
+    if (IsWindow(hTargetWnd)) {
+        SetWindowPos(hTargetWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    logRemote(L"★ 인증번호(" + code + L") 입력 및 연결 버튼 클릭 완료!");
-
-    // 8. 2초 후 확인 및 보강 (Watchdog: 창이 계속 머물러 있으면 Enter 1회 전송)
-    Sleep(2000);
-    if (IsWindow(hTargetWnd) && IsWindowVisible(hTargetWnd)) {
-        logRemote(L"창이 여전히 대기 상태로 감지되어 2차 확인 Enter 트리거를 1회 전송합니다.");
-        keybd_event(VK_RETURN, 0, 0, 0);
-        Sleep(50);
-        keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0);
-    }
-
-    logRemote(L"=== 애니서포트 원격지원 자동화 완료 ===");
+    logRemote(L"=== 애니서포트 원격지원 키보드 자동화 완료 ===");
+    if (hRemMutex) CloseHandle(hRemMutex);
     return 0;
 }
 
@@ -4318,11 +4585,40 @@ int RunPeBootInitMode(const std::wstring& appDir) {
         rc = RunPeAutoNetMode(foundBridgeDir.empty() ? appDir : foundBridgeDir);
     }
 
-    // Launch AnySupport Auto-Connect asynchronously so boot init is not blocked
+    // 3. Launch AnySupport Auto-Connect as a persistent independent process (using latest OneTimePE_Runner.exe if available)
     if (shouldRemoteSupport && !remoteCode.empty()) {
-        std::thread([remoteCode, remoteExe]() {
+        std::wstring runnerExe;
+        if (!foundBridgeDir.empty()) {
+            std::wstring candRunner = JoinPath(foundBridgeDir, L"OneTimePE_Runner.exe");
+            if (GetFileAttributesW(candRunner.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                runnerExe = candRunner;
+            }
+        }
+        if (runnerExe.empty()) {
+            wchar_t selfBuf[MAX_PATH * 4]{};
+            if (GetModuleFileNameW(nullptr, selfBuf, _countof(selfBuf)) > 0) {
+                runnerExe = selfBuf;
+            }
+        }
+
+        bool launchedChild = false;
+        if (!runnerExe.empty()) {
+            std::wstring cmdLine = L"\"" + runnerExe + L"\" --pe-remote-support " + remoteCode + L" " + remoteExe;
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            si.dwFlags = STARTF_USESHOWWINDOW;
+            si.wShowWindow = SW_HIDE;
+            PROCESS_INFORMATION pi{};
+            if (CreateProcessW(runnerExe.c_str(), cmdLine.data(), nullptr, nullptr, FALSE,
+                               CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                launchedChild = true;
+            }
+        }
+        if (!launchedChild) {
             RunPeRemoteSupportMode(remoteCode, remoteExe);
-        }).detach();
+        }
     }
 
     if (hMutex) CloseHandle(hMutex);

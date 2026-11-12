@@ -573,12 +573,6 @@ bool IsWimCurrentlyPatched(const ResolvedFileInfo& wimInfo) {
     if (!wimInfo.exists) {
         return false;
     }
-    if (!g_cfg.patchedWimSig.empty()) {
-        std::wstring curSig = net_sync::ComputeFileSignature(wimInfo.fullPath);
-        if (!curSig.empty() && curSig == g_cfg.patchedWimSig) {
-            return true;
-        }
-    }
     return net_sync::IsWimUnattendedPatched(wimInfo.fullPath, 0);
 }
 
@@ -2796,16 +2790,17 @@ void ActionQueueOneTimeBoot(bool rebootImmediately, bool skipUnpatchedPrompt = f
     ResolvedFileInfo wimInfo{}, sdiInfo{};
     if (!ValidateInputsAndFiles(wimInfo, sdiInfo, followUp)) return;
 
-    // Check unattended network auto-apply option & WIM patch state
-    if (g_cfg.autoApplyNetwork && !skipUnpatchedPrompt && !IsWimCurrentlyPatched(wimInfo)) {
+    // Check unattended network / remote support auto-apply option & WIM patch state
+    if ((g_cfg.autoApplyNetwork || (g_cfg.remoteSupportEnable && !g_cfg.remoteSupportCode.empty())) &&
+        !skipUnpatchedPrompt && !IsWimCurrentlyPatched(wimInfo)) {
         int ans = MessageBoxW(
             g_hMainWnd,
-            L"'PE 부팅 시 현재 네트워크 자동 적용' 옵션이 켜져 있으나,\n"
-            L"현재 선택한 WIM 파일에 아직 [무인 자동 실행 패치]가 적용되어 있지 않습니다.\n\n"
-            L"• [예(Y)] : 지금 자동으로 WIM 무인 패치(최초 1회)를 먼저 적용한 뒤 이어서 부팅 예약을 진행합니다.\n"
-            L"• [아니오(N)] : WIM 수정 없이 네트워크 설정/드라이버만 추출한 뒤 진행합니다.\n"
+            L"네트워크 자동 적용 또는 애니서포트(원격지원) 자동 연결 옵션이 켜져 있으나,\n"
+            L"현재 선택한 WIM 파일에 최신 [무인 자동화 & 원격지원 키보드 입력 패치]가 적용되어 있지 않거나 구버전입니다.\n\n"
+            L"• [예(Y)] : 지금 자동으로 WIM 패치(1회 갱신)를 먼저 적용한 뒤 이어서 부팅 예약을 진행합니다.\n"
+            L"• [아니오(N)] : WIM 수정 없이 설정 파일만 저장한 뒤 진행합니다.\n"
             L"• [취소] : 작업을 중단합니다.",
-            L"WIM 무인 네트워크 패치 안내",
+            L"WIM 무인 자동화 패치 갱신 안내",
             MB_ICONQUESTION | MB_YESNOCANCEL);
         if (ans == IDCANCEL) return;
         if (ans == IDYES) {
